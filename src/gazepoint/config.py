@@ -66,6 +66,16 @@ DEFAULTS: dict = {
         "background": "#303030",
         "jpeg_quality": 92,
     },
+    "calibrate": {
+        # Refuse to save a fit (keep the previous calibration) when the gaze
+        # correction has collapsed (smallest singular value of A below
+        # min_gain: the fit ignores gaze and just places screens around a
+        # constant direction) or too many frames land on the wrong screen.
+        # This happens when the net's raw gaze doesn't track the targets,
+        # e.g. a backlit or shadowed face. `calibrate --force` saves anyway.
+        "min_gain": 0.3,
+        "max_wrong_screen": 0.3,
+    },
     "run": {
         "hotkey": "KEY_RIGHTCTRL",
         "latch_ms": 120,

@@ -87,19 +87,27 @@ def cmd_monitors(cfg, args):
                  "monitors": [m.to_json() for m in mons]})
 
 
-def run_calibrate(cfg, session: str, mode: str | None, refit_user: bool):
+def run_calibrate(cfg, session: str, mode: str | None, refit_user: bool, force: bool = False):
     path = record.resolve(session)
     meta, recs = record.load(path)
     mons = record.monitors_of(meta)
     mode = mode or meta.get("mode", "full")
     recs = record.labelled(meta, recs)
-    A, screens, report = calib.calibrate(recs, mons, cfg, mode, refit_user, meta["id"])
+    try:
+        A, screens, report = calib.calibrate(recs, mons, cfg, mode, refit_user, meta["id"], force)
+    except calib.UnreliableFit as e:
+        _print_json(e.report)
+        raise
     _print_json(report)
     return report
 
 
 def cmd_calibrate(cfg, args):
-    run_calibrate(cfg, args.session or record.latest("collect").name, args.mode, args.refit_user)
+    session = args.session or record.latest("collect").name
+    try:
+        run_calibrate(cfg, session, args.mode, args.refit_user, args.force)
+    except calib.UnreliableFit as e:
+        sys.exit(f"ERROR: {e}")
 
 
 def cmd_eval(cfg, args):
@@ -193,6 +201,7 @@ def main(argv=None):
     k.add_argument("session", nargs="?", help="session id/path (default: latest collect)")
     k.add_argument("--mode", choices=["full", "quick"])
     k.add_argument("--refit-user", action="store_true", help="also refit the per-user correction in quick mode")
+    k.add_argument("--force", action="store_true", help="save even if the fit looks unreliable")
     e = sub.add_parser("eval", help="error stats for a session against the current calibration")
     e.add_argument("session", nargs="?")
     r = sub.add_parser("reprocess", help="rerun perception on a session's saved frames")

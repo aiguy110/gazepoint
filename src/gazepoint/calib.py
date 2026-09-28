@@ -375,7 +375,40 @@ class NotCalibrated(RuntimeError):
     pass
 
 
-def calibrate(recs: list[dict], mons: list[Monitor], cfg: dict, mode: str, refit_user: bool, session: str):
+class UnreliableFit(NotCalibrated):
+    """The fit looks wrong; nothing was saved. `.report` holds what it found."""
+
+    def __init__(self, msg: str, report: dict):
+        super().__init__(msg)
+        self.report = report
+
+
+def collapsed(A: np.ndarray, cfg: dict) -> bool:
+    scales = np.linalg.svd(A[:, :2], compute_uv=False)
+    return scales.min() < cfg["calibrate"]["min_gain"] or np.linalg.det(A[:, :2]) < 0
+
+
+def fit_problems(A: np.ndarray, ev: dict, cfg: dict) -> list[str]:
+    lim = cfg["calibrate"]
+    out = []
+    if collapsed(A, cfg):
+        scales = np.linalg.svd(A[:, :2], compute_uv=False)
+        out.append(f"gaze correction collapsed (singular values {scales.round(2).tolist()})")
+    for name, e in ev.items():
+        if e["wrong_screen"] > lim["max_wrong_screen"]:
+            out.append(f"{e['wrong_screen']:.0%} of {name} frames land on the wrong screen")
+    return out
+
+
+def calibrate(
+    recs: list[dict],
+    mons: list[Monitor],
+    cfg: dict,
+    mode: str,
+    refit_user: bool,
+    session: str,
+    force: bool = False,
+):
     """Fit from a recorded session. mode: 'full' (new constellation) or 'quick'
     (re-place a known constellation). Returns (A, screens, report dict)."""
     s = Samples.from_records(recs)
@@ -389,6 +422,10 @@ def calibrate(recs: list[dict], mons: list[Monitor], cfg: dict, mode: str, refit
     report: dict = {"mode": mode, "profile_key": key, "frames": len(s)}
 
     A_prev = load_user()
+    if A_prev is not None and collapsed(A_prev, cfg):
+        # saved before fits were checked; don't build on it
+        report["refit_user"] = "saved gaze correction was collapsed"
+        A_prev = None
     fit_A = mode == "full" or refit_user or A_prev is None
     present = [sid for sid in ext_ids if np.any(s.screen == sid)]
     if mode == "full":
@@ -459,6 +496,17 @@ def calibrate(recs: list[dict], mons: list[Monitor], cfg: dict, mode: str, refit
             "check `gazepoint preview` for sign/convention problems or a poorly lit face"
         )
     report["eval"] = evaluate(s, A, list(screens.values()))
+    problems = fit_problems(A, report["eval"], cfg)
+    if problems:
+        report["problems"] = problems
+        if not force:
+            raise UnreliableFit(
+                "fit rejected, previous calibration kept: " + "; ".join(problems)
+                + ". Either raw gaze isn't tracking the targets (backlit or shadowed face?) or"
+                " the monitor pose fit failed. Collect again in even light, or"
+                " `gazepoint calibrate --force` to save it anyway.",
+                report,
+            )
 
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     if fit_A:

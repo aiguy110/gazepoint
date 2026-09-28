@@ -52,6 +52,11 @@ different external monitors.
   skips collection and uses the saved calibration.
 - Fit quality is judged in gaze space, not by parameter recovery: `A`'s scale
   trades off against screen depth, and that trade-off is harmless.
+- `calibrate` refuses to save a fit whose `A` has collapsed (the fitter can
+  "explain" gaze that doesn't track the targets by making `A` ~0 and parking
+  monitors along a constant direction) or that puts too many frames on the
+  wrong screen (`[calibrate]` thresholds; `--force` overrides). A collapsed
+  saved `user.json` is refit rather than reused.
 
 ## Conventions (get these right or everything silently breaks)
 

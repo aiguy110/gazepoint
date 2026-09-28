@@ -129,3 +129,27 @@ def test_occluded_monitor_not_placed_behind_lid():
     P = np.array([ext.point_cam(u, v) for u in (0, EXT.width_mm) for v in (0, EXT.height_mm)])
     assert calib.occlusion_depth(lap, eye, P).max() < 5.0
     assert rep["eval"][f"dell [{EXT.id}]"]["wrong_screen"] < 0.05
+
+
+def test_collapsed_fit_is_not_saved(tmp_path):
+    """Raw gaze that ignores the targets (backlit face) must not overwrite calibration."""
+    rng = np.random.default_rng(3)
+    recs = synth(ext_poses(), 9)
+    for r in recs:
+        r["obs"]["gaze_raw"] = (np.array([20.0, -10.0]) + rng.normal(0, 4, 2)).tolist()
+    with pytest.raises(calib.UnreliableFit) as e:
+        calib.calibrate(recs, [LAPTOP, EXT, EXT2], CFG, "full", False, "bad")
+    assert e.value.report["problems"]
+    assert not (tmp_path / "user.json").exists()
+    calib.calibrate(recs, [LAPTOP, EXT, EXT2], CFG, "full", False, "bad", force=True)
+    assert (tmp_path / "user.json").exists()
+
+
+def test_collapsed_saved_correction_is_refit():
+    truth = ext_poses()
+    mons = [LAPTOP, EXT, EXT2]
+    calib.calibrate(synth(truth, 9), mons, CFG, "full", False, "s1")
+    calib._write(config.home() / "user.json", {"A": [[0.08, 0, 0], [0, 0.01, 0]]})
+    A, _, rep = calib.calibrate(synth(ext_poses(yaw_deg=6), 5, seed=1), mons, CFG, "quick", False, "s2")
+    assert "refit_user" in rep
+    assert np.abs(A[:, :2] - A_TRUE[:, :2]).max() < 0.15
