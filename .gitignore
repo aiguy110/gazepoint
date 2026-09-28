@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# pulled from target machines by scripts/pull-data.sh
+data/
