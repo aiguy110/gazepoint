@@ -327,9 +327,23 @@ def _pose_load(d):
     return np.array(d["R"], dtype=np.float64), np.array(d["t"], dtype=np.float64)
 
 
-def load_user() -> np.ndarray | None:
+# user.json files written before the model was recorded were all fit on this one
+LEGACY_GAZE_MODEL = "mobileone_s0"
+
+
+def load_user(gaze_model: str) -> np.ndarray | None:
+    """The saved correction, if it was fit for this gaze model (A is model-specific)."""
     d = _read(config.home() / "user.json")
-    return np.array(d["A"]) if d else None
+    if not d or d.get("gaze_model", LEGACY_GAZE_MODEL) != gaze_model:
+        return None
+    return np.array(d["A"])
+
+
+def session_gaze_model(recs: list[dict], default: str) -> str:
+    names = {r["obs"].get("gaze_model") or default for r in recs if r.get("obs")}
+    if len(names) > 1:
+        raise RuntimeError(f"session mixes gaze models {sorted(names)}; `gazepoint reprocess --all` it")
+    return names.pop() if names else default
 
 
 def load_profile(key: str) -> dict | None:
@@ -421,12 +435,16 @@ def calibrate(
     ext_ids = [sid for sid in screens if sid != bid]
     report: dict = {"mode": mode, "profile_key": key, "frames": len(s)}
 
-    A_prev = load_user()
+    gaze_model = session_gaze_model(recs, cfg["gaze"]["model"])
+    report["gaze_model"] = gaze_model
+    A_prev = load_user(gaze_model)
     if A_prev is not None and collapsed(A_prev, cfg):
         # saved before fits were checked; don't build on it
         report["refit_user"] = "saved gaze correction was collapsed"
         A_prev = None
-    fit_A = mode == "full" or refit_user or A_prev is None
+    # A is per user, not per desk: a new desk reuses it (the laptop panel may be a
+    # poor gauge there, e.g. looked at steeply down), unless asked to refit.
+    fit_A = refit_user or A_prev is None
     present = [sid for sid in ext_ids if np.any(s.screen == sid)]
     if mode == "full":
         missing = set(ext_ids) - set(present)
@@ -510,7 +528,7 @@ def calibrate(
 
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     if fit_A:
-        _write(config.home() / "user.json", {"A": A.tolist(), "updated": now, "session": session})
+        _write(config.home() / "user.json", {"A": A.tolist(), "gaze_model": gaze_model, "updated": now, "session": session})
     if ext_ids:
         anchor = pick_anchor(screens) if mode == "full" else report["anchor"]
         a = screens[anchor]
@@ -541,9 +559,9 @@ def calibrate(
 
 def load_runtime(mons: list[Monitor], cfg: dict) -> tuple[np.ndarray, list[Screen]]:
     """A and camera-frame screens for the currently connected monitors."""
-    A = load_user()
+    A = load_user(cfg["gaze"]["model"])
     if A is None:
-        raise NotCalibrated("no user calibration; run `gazepoint collect`")
+        raise NotCalibrated(f"no user calibration for gaze model {cfg['gaze']['model']}; run `gazepoint collect`")
     screens = screens_from_monitors(mons, cfg)
     key = profile_key(mons)
     ext_ids = [sid for sid, s in screens.items() if not s.builtin]

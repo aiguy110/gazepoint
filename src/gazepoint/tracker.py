@@ -1,4 +1,4 @@
-"""Per-frame perception: MediaPipe landmarks -> head pose (PnP) -> face crop -> gaze net.
+"""Per-frame perception: MediaPipe landmarks -> head pose (PnP) -> face image -> gaze net.
 
 Produces an Observation holding only *uncalibrated* quantities; the per-user
 correction and screen geometry are applied downstream (calib.py), so recorded
@@ -15,11 +15,14 @@ import numpy as np
 from mediapipe.tasks.python import BaseOptions, vision
 
 from . import models
-from .gaze import GazeNet, face_frame
+from .gaze import EthXGazeNet, GazeNet, face_frame, normalize_face, vec_to_angles
 
 # Canonical-model vertices used to place the eyes (outer/inner corners, lids).
 _RIGHT_EYE = [33, 133, 159, 145]
 _LEFT_EYE = [362, 263, 386, 374]
+# ETH-XGaze's face centre: mean of the eye-corner centre and the nostril centre.
+_EYE_CORNERS = [33, 133, 362, 263]
+_NOSTRILS = [98, 327]
 
 
 def intrinsics(width: int, height: int, hfov_deg: float) -> np.ndarray:
@@ -56,6 +59,7 @@ class Observation:
     gaze_raw: list  # [yaw, pitch] degrees, model output in the model's frame
     frame_R: list  # 3x3, model frame -> camera (identity if face_centered is off)
     landmarks: list | None = None  # 478x2 px, only kept when recording
+    gaze_model: str | None = None  # None in sessions recorded before this was stored
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -77,7 +81,12 @@ class Tracker:
         self.eye_mid = (
             self.canonical[_RIGHT_EYE].mean(axis=0) + self.canonical[_LEFT_EYE].mean(axis=0)
         ) / 2
-        self.net = GazeNet(str(models.gaze_model_path(cfg["gaze"]["model"])))
+        self.model = cfg["gaze"]["model"]
+        self.eth = models.is_eth(self.model)
+        path = str(models.gaze_model_path(self.model))
+        self.net = EthXGazeNet(path) if self.eth else GazeNet(path)
+        c = self.canonical
+        self.face_center = (c[_EYE_CORNERS].mean(axis=0) + c[_NOSTRILS].mean(axis=0)) / 2
         self._rvec = None
         self._tvec = None
         self._last_ms = -1
@@ -136,11 +145,21 @@ class Tracker:
             return None
         R, tv = pose
         eye_origin = R @ self.eye_mid + tv
-        crop, bbox = self.crop(frame, lm)
-        if crop.size == 0:
-            return None
-        yaw, pitch = self.net(crop)
-        fR = face_frame(eye_origin) if self.cfg["gaze"]["face_centered"] else np.eye(3)
+        if self.eth:
+            # Gaze in the normalised camera -> camera -> the same face-centred
+            # angles the Gaze360 path reports, so calibration code is shared.
+            face, Rn = normalize_face(frame, self.K, R[:, 0], R @ self.face_center + tv)
+            fR = face_frame(eye_origin)
+            yaw, pitch = vec_to_angles(fR.T @ (Rn.T @ self.net(face)))
+            x0, y0 = lm.min(axis=0)
+            x1, y1 = lm.max(axis=0)
+            bbox = [int(x0), int(y0), int(x1), int(y1)]
+        else:
+            crop, bbox = self.crop(frame, lm)
+            if crop.size == 0:
+                return None
+            yaw, pitch = self.net(crop)
+            fR = face_frame(eye_origin) if self.cfg["gaze"]["face_centered"] else np.eye(3)
         hy, hp = head_angles(R)
         return Observation(
             t=t,
@@ -154,4 +173,5 @@ class Tracker:
             gaze_raw=[round(float(np.degrees(yaw)), 4), round(float(np.degrees(pitch)), 4)],
             frame_R=fR.round(6).tolist(),
             landmarks=lm.round(2).tolist() if keep_landmarks else None,
+            gaze_model=self.model,
         )

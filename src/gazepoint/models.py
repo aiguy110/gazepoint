@@ -18,7 +18,17 @@ CANONICAL_FACE_URL = (
 )
 # yakhyo/gaze-estimation (MIT): L2CS-style nets trained on Gaze360, 90 bins x 4 deg.
 GAZE_URL = "https://github.com/yakhyo/gaze-estimation/releases/download/weights/{name}_gaze.onnx"
-GAZE_MODELS = ("mobileone_s0", "mobilenetv2", "resnet18", "resnet34", "resnet50")
+GAZE360_MODELS = ("mobileone_s0", "mobilenetv2", "resnet18", "resnet34", "resnet50")
+# hysts/pytorch_mpiigaze_demo (MIT code; ETH-XGaze data is CC BY-NC-SA): ResNet-18 on
+# normalised ETH-XGaze faces. Much more robust to lighting than the Gaze360 nets.
+# Published as PyTorch weights only; converted to ONNX at download time.
+ETH_URL = "https://huggingface.co/hysts/ptgaze-eth-xgaze-resnet18/resolve/main/model.safetensors"
+ETH_MODELS = ("ethxgaze_resnet18",)
+GAZE_MODELS = ETH_MODELS + GAZE360_MODELS
+
+
+def is_eth(name: str) -> bool:
+    return name in ETH_MODELS
 
 
 def face_landmarker_path() -> Path:
@@ -53,7 +63,19 @@ def download(gaze_models: list[str] | None = None) -> None:
     _fetch(FACE_LANDMARKER_URL, face_landmarker_path())
     _fetch(CANONICAL_FACE_URL, canonical_face_path())
     for n in names:
-        _fetch(GAZE_URL.format(name=n), gaze_model_path(n))
+        if is_eth(n):
+            dest = gaze_model_path(n)
+            if dest.exists():
+                print(f"  have {dest.name}")
+                continue
+            weights = config.models_dir() / f"{n}.safetensors"
+            _fetch(ETH_URL, weights)
+            from .resnet_onnx import convert
+
+            print(f"  converting to {dest.name}")
+            convert(weights, dest)
+        else:
+            _fetch(GAZE_URL.format(name=n), gaze_model_path(n))
 
 
 def check(cfg: dict) -> list[str]:

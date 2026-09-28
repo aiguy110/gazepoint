@@ -54,8 +54,8 @@ def fixation_problem(gaze: list, cc: dict) -> str | None:
     return None
 
 
-def choose_mode(mons: list[Monitor]) -> str:
-    if calib.load_user() is None:
+def choose_mode(mons: list[Monitor], cfg: dict) -> str:
+    if calib.load_user(cfg["gaze"]["model"]) is None:
         return "full"
     if all(m.builtin for m in mons):
         return "quick"
@@ -99,7 +99,7 @@ class Collector:
         self.cfg = cfg
         self.do_calibrate = do_calibrate
         self.mons = detect()
-        self.mode = choose_mode(self.mons) if mode == "auto" else mode
+        self.mode = choose_mode(self.mons, cfg) if mode == "auto" else mode
         cc = cfg["collect"]
         n = points or (cc["points_full"] if self.mode == "full" else cc["points_quick"])
         self.targets = []

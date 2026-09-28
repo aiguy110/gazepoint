@@ -34,13 +34,16 @@ DEFAULTS: dict = {
         "hfov_deg": 70.0,
     },
     "gaze": {
-        "model": "mobileone_s0",  # mobileone_s0 | mobilenetv2 | resnet18 | resnet34 | resnet50
-        # Side of the square face crop fed to the gaze net, relative to the
-        # landmark bounding box. Pretrained nets expect RetinaFace-ish boxes.
+        # ethxgaze_resnet18 (ETH-XGaze, normalised faces; far more robust to
+        # lighting) or a Gaze360 net: mobileone_s0 | mobilenetv2 | resnet18 |
+        # resnet34 | resnet50. The per-user correction is fit per model.
+        "model": "ethxgaze_resnet18",
+        # Gaze360 nets only: side of the square face crop fed to the net,
+        # relative to the landmark bounding box (they expect RetinaFace-ish boxes).
         "crop_scale": 1.0,
-        # Interpret model output relative to a virtual camera looking straight
-        # at the face (how Gaze360 crops are rectified) rather than the real
-        # camera axis.
+        # Gaze360 nets only: interpret model output relative to a virtual camera
+        # looking straight at the face (how Gaze360 crops are rectified) rather
+        # than the real camera axis.
         "face_centered": True,
     },
     "laptop": {

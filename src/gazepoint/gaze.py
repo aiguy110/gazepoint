@@ -70,3 +70,41 @@ class GazeNet:
         x = ((img.astype(np.float32) / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)[None]
         yaw_logits, pitch_logits = self.session.run(None, {self.input_name: x})
         return float(self._decode(yaw_logits)[0]), float(self._decode(pitch_logits)[0])
+
+
+def normalize_face(frame, K, head_x, center, focal=960.0, distance=600.0, size=224):
+    """ETH-XGaze data normalisation (Zhang et al., ETRA 2018): re-render the frame
+    from a virtual camera `distance` mm from `center` (mm, camera frame), aimed
+    straight at it, with its x-axis aligned to the head's (`head_x`, camera frame).
+
+    Returns (size x size image, R) with R rotating camera coords -> normalised coords.
+    """
+    dist = np.linalg.norm(center)
+    fwd = center / dist
+    down = np.cross(fwd, head_x)
+    down /= np.linalg.norm(down)
+    right = np.cross(down, fwd)
+    R = np.stack([right, down, fwd])
+    Kn = np.array([[focal, 0, size / 2], [0, focal, size / 2], [0, 0, 1.0]])
+    W = Kn @ np.diag([1.0, 1.0, distance / dist]) @ R @ np.linalg.inv(K)
+    return cv2.warpPerspective(frame, W, (size, size)), R
+
+
+class EthXGazeNet:
+    """Regression net trained on normalised ETH-XGaze faces (hysts/ptgaze ResNet-18):
+    normalised 224x224 face -> gaze direction in the normalised camera frame."""
+
+    def __init__(self, path: str):
+        avail = ort.get_available_providers()
+        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
+        self.session = ort.InferenceSession(path, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.providers = self.session.get_providers()
+
+    def __call__(self, face_bgr: np.ndarray) -> np.ndarray:
+        img = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+        x = ((img.astype(np.float32) / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)[None]
+        pitch, yaw = self.session.run(None, {self.input_name: x})[0][0]
+        # ETH-XGaze labels point from the target back at the face; flip to a gaze direction.
+        # That makes it the same form as angles_to_vec, just in the normalised frame.
+        return angles_to_vec(float(yaw), float(pitch))

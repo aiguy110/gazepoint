@@ -93,6 +93,9 @@ def run_calibrate(cfg, session: str, mode: str | None, refit_user: bool, force: 
     mons = record.monitors_of(meta)
     mode = mode or meta.get("mode", "full")
     recs = record.labelled(meta, recs)
+    for r in recs:  # sessions recorded before observations named their model
+        if r.get("obs") and not r["obs"].get("gaze_model"):
+            r["obs"]["gaze_model"] = meta["config"]["gaze"]["model"]
     try:
         A, screens, report = calib.calibrate(recs, mons, cfg, mode, refit_user, meta["id"], force)
     except calib.UnreliableFit as e:

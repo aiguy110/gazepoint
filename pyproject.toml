@@ -11,6 +11,9 @@ dependencies = [
   "opencv-contrib-python>=4.9",
   "mediapipe>=0.10.14,<2",
   "onnxruntime>=1.18",
+  # ETH-XGaze weights ship as safetensors; converted to ONNX at download time
+  "onnx>=1.16",
+  "safetensors>=0.4",
   "evdev-binary>=1.7",
   "python-xlib>=0.33",
   "jeepney>=0.8",

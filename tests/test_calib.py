@@ -149,7 +149,15 @@ def test_collapsed_saved_correction_is_refit():
     truth = ext_poses()
     mons = [LAPTOP, EXT, EXT2]
     calib.calibrate(synth(truth, 9), mons, CFG, "full", False, "s1")
-    calib._write(config.home() / "user.json", {"A": [[0.08, 0, 0], [0, 0.01, 0]]})
+    calib._write(config.home() / "user.json", {"A": [[0.08, 0, 0], [0, 0.01, 0]], "gaze_model": CFG["gaze"]["model"]})
     A, _, rep = calib.calibrate(synth(ext_poses(yaw_deg=6), 5, seed=1), mons, CFG, "quick", False, "s2")
     assert "refit_user" in rep
     assert np.abs(A[:, :2] - A_TRUE[:, :2]).max() < 0.15
+
+
+def test_user_correction_is_per_gaze_model():
+    calib.calibrate(synth(ext_poses(), 9), [LAPTOP, EXT, EXT2], CFG, "full", False, "s1")
+    assert calib.load_user(CFG["gaze"]["model"]) is not None
+    assert calib.load_user("some_other_model") is None
+    with pytest.raises(calib.NotCalibrated):
+        calib.load_runtime([LAPTOP, EXT, EXT2], {**CFG, "gaze": {**CFG["gaze"], "model": "some_other_model"}})

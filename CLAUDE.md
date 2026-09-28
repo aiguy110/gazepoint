@@ -27,14 +27,27 @@ different external monitors.
   after the jump. Head angles go through a One Euro filter. The cursor is not
   smoothed with a PID loop; that only adds lag.
 - **Perception** (`tracker.py`): MediaPipe Face Landmarker gives landmarks,
-  `cv2.solvePnP` against MediaPipe's canonical face gives head pose and eye
-  origin, and a pretrained L2CS-style net (yakhyo/gaze-estimation, Gaze360,
-  ONNX) takes the square face crop and outputs (yaw, pitch). Observations hold
-  only *uncalibrated* values, so recorded data survives calibration changes.
+  and `cv2.solvePnP` against MediaPipe's canonical face gives head pose and eye
+  origin. The default gaze net is ETH-XGaze ResNet-18 (hysts/ptgaze). Its input
+  is an ETH-XGaze *normalised* face (`gaze.normalize_face`): a virtual camera
+  600 mm from the face centre, rolled to the head's x-axis, 224². It's
+  published only as PyTorch weights, so `download-models` converts the
+  safetensors to ONNX without torch (`resnet_onnx.py`). Its output is rotated
+  into the same face-centred (yaw, pitch) the older Gaze360 nets
+  (yakhyo/gaze-estimation, square crop) report, so calibration code is shared.
+  In a 2026-09 comparison on recorded sessions, the Gaze360 nets failed in
+  backlit scenes. ETH-XGaze held up, and UniGaze-B was better still but ~8×
+  slower (the Phase 2 teacher). Observations hold only *uncalibrated* values
+  plus `gaze_model`, so recorded data survives calibration changes and
+  `reprocess` can swap models.
 - **Three calibration layers** (`calib.py`), persisted separately because they
   change on different timescales:
   1. `user.json`: a 2×3 affine `A` on the net's (yaw, pitch) in degrees. It
-     absorbs kappa and model bias and is the same at every desk.
+     absorbs kappa and model bias and is the same at every desk. It's tagged
+     with the gaze model it was fit for and ignored for any other model. Once
+     it exists, a full calibration at a new desk reuses it and fits only
+     monitor poses (`--refit-user` to refit). At some desks the laptop panel is
+     a poor gauge, e.g. looked at steeply down through glare.
   2. `profiles/<sha1(key)[:12]>.json`: external monitor poses relative to an
      anchor monitor. The key is the sorted EDID ids of the external monitors
      (`monitors.profile_key`).
@@ -108,8 +121,9 @@ in. Models live in `models/`. User config lives in
   over python-xlib's own connection instead.
 - Use `evdev-binary` (prebuilt wheels), not `evdev`. The target may not have
   a compiler.
-- Perception costs about 23 ms/frame on bifrost's CPU (landmarks 12 ms, gaze
-  net 10 ms at 448²). The laptop will be slower, so check `preview` fps.
+- Perception costs about 30 ms/frame on bifrost's CPU with ETH-XGaze
+  (landmarks ~12 ms, gaze net ~17 ms at 224²; the old Gaze360 MobileOne net
+  was ~10 ms at 448²). The laptop will be slower, so check `preview` fps.
 
 ## Not yet verified on real hardware (check these first)
 
