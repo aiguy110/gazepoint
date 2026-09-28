@@ -52,7 +52,7 @@ def live(tmp_path, monkeypatch):
     import threading
 
     lv.lock = threading.Lock()
-    lv.state, lv.latch, lv.writer, lv.events = "idle", [], None, 0
+    lv.state, lv.latch, lv.writer, lv.events, lv.latch_warned = "idle", [], None, 0, False
     return lv
 
 
@@ -74,3 +74,15 @@ def test_press_jump_refine_release(live):
     assert live.pointer.moves[-1][0] > x + 100  # cursor moved right
     live.on_key(False, t)
     assert live.state == "idle"
+
+
+def test_no_face_explains_once(live, capsys):
+    live.tracker.process = lambda *a, **k: None
+    live.on_key(True, 0.0)
+    for i in range(1, 20):
+        live.step(None, i / 30, i)
+    live.on_key(False, 1.0)
+    out = capsys.readouterr().out
+    assert out.count("still waiting to jump: face not detected") == 1
+    assert "before a gaze fix" in out
+    assert live.pointer.moves == []

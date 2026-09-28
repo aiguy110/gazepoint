@@ -117,6 +117,12 @@ in. Models live in `models/`. User config lives in
 - The `uinput` absolute pointer on Wayland (it mimics QEMU's usb-tablet, and
   compositors should map it to the whole desktop). X11 uses XWarpPointer.
 - Default hotkey is Right Ctrl (not grabbed, so apps still see it).
+  `run` prints hotkey down, the jump, and hotkey up, plus why a jump is
+  stalled. It also hints once if the opposite-side key is pressed instead.
+  The listener rescans every 2 s for keyboards that (re)connect. The
+  operator's ZMK keyboard uses home-row mods: Right Ctrl is a hold on the
+  right pinky with a 200 ms tapping term, so expect that much lag before the
+  hotkey registers.
   `scripts/setup-input-perms.sh` is needed for `/dev/input` and `/dev/uinput`.
 
 ## Roadmap

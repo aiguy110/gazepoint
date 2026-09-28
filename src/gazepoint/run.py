@@ -103,7 +103,8 @@ class Live:
     def on_key(self, down: bool, t: float):
         with self.lock:
             if down and self.state == "idle":
-                self.state, self.latch_t, self.latch = "latching", t, []
+                self.state, self.latch_t, self.latch, self.latch_warned = "latching", t, [], False
+                print("hotkey down: reading gaze")
             elif not down and self.state != "idle":
                 self._release()
 
@@ -116,6 +117,10 @@ class Live:
 
     def _release(self):
         """Called with lock held."""
+        if self.state == "held":
+            print(f"hotkey up: cursor at ({self.pos[0]:.0f}, {self.pos[1]:.0f})")
+        else:
+            print("hotkey up before a gaze fix; cursor not moved")
         if self.state == "held" and self.latch and self._writer():
             self.events += 1
             tgt = self._target(*self.pos, self.events, "release")
@@ -125,11 +130,19 @@ class Live:
         self.state = "idle"
         self.latch = []
 
+    def _latch_stalled(self, t: float, why: str):
+        """Called with lock held: say once per press why the jump hasn't happened yet."""
+        if self.state == "latching" and not self.latch_warned and t - self.latch_t >= self.cfg["run"]["latch_ms"] / 1000:
+            self.latch_warned = True
+            print(f"still waiting to jump: {why}")
+
     # ------------------------------------------------------------ main loop
 
     def step(self, frame, t, seq):
         obs = self.tracker.process(frame, t, seq)
         if obs is None:
+            with self.lock:
+                self._latch_stalled(t, "face not detected")
             return
         yaw = self.f_yaw(obs.head_yaw, t)
         pitch = self.f_pitch(obs.head_pitch, t)
@@ -139,13 +152,17 @@ class Live:
                 hit = gaze_px(self.A, self.screens, obs)
                 if hit:
                     self.latch.append((frame, obs, hit))
+                else:
+                    self._latch_stalled(t, "gaze misses every screen")
                 if t - self.latch_t >= rc["latch_ms"] / 1000 and self.latch:
                     xs = np.array([[h[1], h[2]] for _, _, h in self.latch])
                     self.anchor = tuple(np.median(xs, axis=0))
                     self.head0 = (yaw, pitch)
                     self.state = "held"
-                    self.pos = clamp_desktop(self.mons, *self.anchor)[:2]
+                    x, y, m = clamp_desktop(self.mons, *self.anchor)
+                    self.pos = (x, y)
                     self.pointer.move(*self.pos)
+                    print(f"jump to ({x:.0f}, {y:.0f}) on {m.name}, median of {len(self.latch)} gaze frames")
             elif self.state == "held":
                 g = rc["gain_px_per_deg"]
                 x = self.anchor[0] + g * (yaw - self.head0[0])
@@ -155,7 +172,8 @@ class Live:
 
     def run(self):
         self.listener.start()
-        print(f"ready: hold {self.cfg['run']['hotkey']} to point (Ctrl-C to quit)")
+        kbds = ", ".join(d.name for d in self.listener.kbds)
+        print(f"ready: hold {self.cfg['run']['hotkey']} to point; listening on {kbds} (Ctrl-C to quit)")
         seq = 0
         n, t_rate = 0, time.monotonic()
         try:

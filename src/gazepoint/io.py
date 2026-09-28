@@ -151,7 +151,13 @@ class InputListener(threading.Thread):
         from evdev import ecodes as e
 
         self.e = e
+        self.key_name = key_name
         self.code = e.ecodes[key_name]
+        # The same key on the other side (KEY_RIGHTCTRL <-> KEY_LEFTCTRL): pressing it is
+        # the usual reason the hotkey "does nothing", so say so once.
+        other = key_name.replace("LEFT", "\0").replace("RIGHT", "LEFT").replace("\0", "RIGHT")
+        self.sibling = (other, e.ecodes[other]) if other != key_name and other in e.ecodes else None
+        self._hinted = False
         self.on_key, self.on_click = on_key, on_click
         self.kbds, self.mice = input_devices(self.code)
         if not self.kbds:
@@ -161,16 +167,32 @@ class InputListener(threading.Thread):
             )
         self._stop = False
 
+    def _rescan(self, devs: dict):
+        """Pick up keyboards that (re)connected since startup, e.g. Bluetooth after sleep."""
+        known = {d.path for d in devs.values()}
+        kbds, mice = input_devices(self.code)
+        for d in kbds + mice:
+            if d.path in known or (d in mice and not self.on_click):
+                d.close()
+                continue
+            devs[d.fd] = d
+            print(f"input: listening on {d.name}")
+
     def run(self):
         e = self.e
         devs = {d.fd: d for d in self.kbds + (self.mice if self.on_click else [])}
+        last_scan = time.monotonic()
         while not self._stop:
+            if time.monotonic() - last_scan > 2:
+                self._rescan(devs)
+                last_scan = time.monotonic()
             r, _, _ = select.select(list(devs), [], [], 0.2)
             for fd in r:
                 try:
                     events = list(devs[fd].read())
                 except OSError:
-                    devs.pop(fd, None)
+                    print(f"input: lost {devs[fd].name}")
+                    devs.pop(fd).close()
                     continue
                 for ev in events:
                     if ev.type != e.EV_KEY:
@@ -180,6 +202,10 @@ class InputListener(threading.Thread):
                         self.on_key(ev.value == 1, t)
                     elif ev.code == e.BTN_LEFT and ev.value == 1 and self.on_click:
                         self.on_click(t)
+                    elif self.sibling and ev.code == self.sibling[1] and ev.value == 1 and not self._hinted:
+                        self._hinted = True
+                        print(f"input: saw {self.sibling[0]}, but the hotkey is {self.key_name} "
+                              "(change [run] hotkey in ~/.config/gazepoint/config.toml)")
 
     def stop(self):
         self._stop = True
