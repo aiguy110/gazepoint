@@ -78,6 +78,11 @@ in. Models live in `models/`. User config lives in
 
 ## Working on it
 
+- **Ship by default.** Once a new feature or bug fix has been validated (tests
+  pass and, where it matters, it has been run on the target), commit it,
+  fast-forward merge it into `main`, and push to `origin` without asking first.
+  The laptop picks up changes through `git pull`, so an unpushed fix doesn't
+  exist as far as it's concerned.
 - `uv run pytest`: synthetic end-to-end calibration (full, then quick after
   "moving the laptop"), EDID parsing, and the live-mode state machine. Keep
   these passing; add synthetic tests for new fitting logic.
@@ -86,6 +91,10 @@ in. Models live in `models/`. User config lives in
   `collect.detect` monkeypatched to fake monitors.
 - `pyproject.toml` forces uv-managed Python because the collect UI needs
   tkinter, which distro Pythons often lack.
+- Never set a Tk `cursor=` (not even `"none"`). uv's Python aborts with an
+  `xcb_xlib_unknown_seq_number` assertion, because its Tk has a static libX11
+  that dlopens the system libXcursor. `collect.hide_cursor` hides the pointer
+  over python-xlib's own connection instead.
 - Use `evdev-binary` (prebuilt wheels), not `evdev`. The target may not have
   a compiler.
 - Perception costs about 23 ms/frame on bifrost's CPU (landmarks 12 ms, gaze

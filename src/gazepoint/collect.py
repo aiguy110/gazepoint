@@ -38,6 +38,29 @@ def choose_mode(mons: list[Monitor]) -> str:
     return "quick" if calib.load_profile(profile_key(mons)) else "full"
 
 
+def hide_cursor(window_ids: list[int]):
+    """Blank the pointer over the given X windows. This goes through python-xlib's own
+    connection because any Tk cursor (even cursor="none") aborts uv's Python: its Tk
+    has a static libX11 that dlopens the system libXcursor, which then drives the
+    same Display through the system libX11 ("xcb_xlib_unknown_seq_number").
+    Returns the connection, which must stay open for the cursor to persist."""
+    try:
+        from Xlib import display
+
+        d = display.Display()
+        pm = d.screen().root.create_pixmap(1, 1, 1)
+        gc = pm.create_gc(foreground=0, background=0)
+        pm.fill_rectangle(gc, 0, 0, 1, 1)
+        blank = pm.create_cursor(pm, (0, 0, 0), (0, 0, 0), 0, 0)
+        for wid in window_ids:
+            d.create_resource_object("window", wid).change_attributes(cursor=blank)
+        d.sync()
+        return d
+    except Exception as e:  # cosmetic only
+        print(f"WARNING: could not hide the cursor: {e}")
+        return None
+
+
 class Collector:
     def __init__(self, cfg: dict, mode: str, rounds: int, points: int | None):
         self.cfg = cfg
@@ -109,7 +132,7 @@ class Collector:
             w.geometry(f"{m.w}x{m.h}+{m.x}+{m.y}")
             w.update_idletasks()
             w.attributes("-fullscreen", True)
-            c = tk.Canvas(w, background=cc["background"], highlightthickness=0, cursor="none")
+            c = tk.Canvas(w, background=cc["background"], highlightthickness=0)
             c.pack(fill="both", expand=True)
             for seq in ("<space>", "<Escape>", "q"):
                 w.bind(seq, self._key)
@@ -122,6 +145,7 @@ class Collector:
             if geoms[mid] != [m.x, m.y, m.w, m.h]:
                 print(f"WARNING: window for {m.name} landed at {geoms[mid]}, expected {[m.x, m.y, m.w, m.h]}")
         self.writer.update_meta(window_geometry=geoms)
+        self._xcursor = hide_cursor([c.winfo_id() for _, c, _ in self.wins.values()])
         builtin = next(v for v in self.wins.values() if v[2].builtin)
         builtin[0].focus_force()
         self.root = root
@@ -130,6 +154,8 @@ class Collector:
         self._intro()
         root.mainloop()
         self.stop = True
+        if self._xcursor:
+            self._xcursor.close()
         return self.writer.id
 
     def _key(self, ev):
