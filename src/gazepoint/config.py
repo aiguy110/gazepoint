@@ -55,6 +55,14 @@ DEFAULTS: dict = {
         "points_quick": 5,
         "settle_ms": 800,
         "capture_ms": 700,
+        # Re-show a target (up to fixation_retries times) when its capture looks
+        # like the user wasn't fixating: raw gaze too scattered (75th pct distance
+        # from the median) or the first and second halves disagree (late saccade,
+        # looked away). Net noise alone is ~5 deg at the 75th pct.
+        "fixation_spread_deg": 9.0,
+        "fixation_drift_deg": 10.0,
+        "fixation_min_frames": 5,
+        "fixation_retries": 2,
         "background": "#303030",
         "jpeg_quality": 92,
     },

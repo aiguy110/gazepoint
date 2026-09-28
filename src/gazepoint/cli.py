@@ -92,7 +92,7 @@ def run_calibrate(cfg, session: str, mode: str | None, refit_user: bool):
     meta, recs = record.load(path)
     mons = record.monitors_of(meta)
     mode = mode or meta.get("mode", "full")
-    recs = [r for r in recs if r.get("target")]
+    recs = record.labelled(meta, recs)
     A, screens, report = calib.calibrate(recs, mons, cfg, mode, refit_user, meta["id"])
     _print_json(report)
     return report
@@ -107,7 +107,7 @@ def cmd_eval(cfg, args):
     meta, recs = record.load(path)
     mons = record.monitors_of(meta)
     A, screens = calib.load_runtime(mons, cfg)
-    s = calib.Samples.from_records([r for r in recs if r.get("target")])
+    s = calib.Samples.from_records(record.labelled(meta, recs))
     print(f"evaluating {path.name} ({len(s)} frames) against current calibration")
     _print_json(calib.evaluate(s, A, screens))
 

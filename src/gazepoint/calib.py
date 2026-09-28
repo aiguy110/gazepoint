@@ -145,12 +145,15 @@ def fit_A_linear(s: Samples, screens: dict[str, Screen], ridge: float = 20.0) ->
     return A
 
 
-def init_pose_pnp(s: Samples, A: np.ndarray, size_mm) -> tuple[np.ndarray, np.ndarray]:
-    """Initial screen pose from gaze bearings, treating the eye as a pinhole camera.
+def init_pose_candidates(s: Samples, A: np.ndarray, size_mm) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Candidate initial screen poses from gaze bearings.
 
     Averages frames per target, rotates bearings into a frame looking along
-    their mean, and solves planar PnP (IPPE). Falls back to 'facing the user
-    650 mm away along the mean gaze' when PnP is degenerate or implausible.
+    their mean, and solves planar PnP (IPPE), treating the eye as a pinhole
+    camera; both IPPE solutions are kept if plausible. Always adds upright
+    poses facing the user along the mean gaze, because PnP on ~3 deg noisy
+    bearings is poorly conditioned in tilt and can start the fit in a basin
+    where the screen is tipped far back. The caller picks by fit cost.
     """
     d = gaze_dir(A, s.raw, s.fR)
     tids = np.unique(s.target_idx)
@@ -158,7 +161,7 @@ def init_pose_pnp(s: Samples, A: np.ndarray, size_mm) -> tuple[np.ndarray, np.nd
     for t in tids:
         m = s.target_idx == t
         obj.append([*s.uv[m][0], 0.0])
-        b = d[m].mean(axis=0)
+        b = np.median(d[m], axis=0)
         bear.append(b / np.linalg.norm(b))
     obj, bear = np.array(obj), np.array(bear)
     o = s.o.mean(axis=0)
@@ -167,31 +170,39 @@ def init_pose_pnp(s: Samples, A: np.ndarray, size_mm) -> tuple[np.ndarray, np.nd
     x = np.cross([0.0, 1.0, 0.0], z)
     x /= np.linalg.norm(x)
     F = np.stack([x, np.cross(z, x), z], axis=1)  # x = user's right, y = down, z = along gaze
-
-    def fallback():
-        c = o + 650.0 * z
-        return F.copy(), c - F @ np.array([size_mm[0] / 2, size_mm[1] / 2, 0.0])
+    half = np.array([size_mm[0] / 2, size_mm[1] / 2, 0.0])
+    out = [(F.copy(), o + dist * z - F @ half) for dist in (650.0, 1000.0)]
 
     if len(obj) < 4:
-        return fallback()
+        return out
     b = bear @ F
     img = (b[:, :2] / b[:, 2:3]).astype(np.float64)
     try:
-        n, rvecs, tvecs, errs = cv2.solvePnPGeneric(
-            obj, img, np.eye(3), None, flags=cv2.SOLVEPNP_IPPE
-        )
+        n, rvecs, tvecs, _ = cv2.solvePnPGeneric(obj, img, np.eye(3), None, flags=cv2.SOLVEPNP_IPPE)
     except cv2.error:
-        return fallback()
-    if not n:
-        return fallback()
-    best = int(np.argmin(np.asarray(errs).ravel()))
-    R = F @ rvec_to_R(rvecs[best])
-    t = F @ tvecs[best].ravel() + o
-    center = R @ np.array([size_mm[0] / 2, size_mm[1] / 2, 0.0]) + t
-    dist = np.linalg.norm(center - o)
-    if not (200.0 < dist < 2500.0) or R[:, 2] @ (center - o) <= 0:
-        return fallback()
-    return R, t
+        return out
+    for rv, tv in zip(rvecs[:n], tvecs[:n]):
+        R = F @ rvec_to_R(rv)
+        t = F @ tv.ravel() + o
+        center = R @ half + t
+        dist = np.linalg.norm(center - o)
+        if 200.0 < dist < 2500.0 and R[:, 2] @ (center - o) > 0:
+            out.append((R, t))
+    return out
+
+
+def occlusion_depth(panel: Screen, eye: np.ndarray, P: np.ndarray) -> np.ndarray:
+    """How far (mm) inside `panel` each sight line eye -> P passes; 0 if clear."""
+    n = panel.R[:, 2]
+    d = P - eye
+    denom = d @ n
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s = (panel.t - eye) @ n / denom
+    local = (eye + s[:, None] * d - panel.t) @ panel.R
+    w, h = panel.size_mm
+    inside = np.minimum.reduce([local[:, 0], w - local[:, 0], local[:, 1], h - local[:, 1]])
+    between = (s > 0) & (s < 1) & np.isfinite(s)
+    return np.where(between, np.maximum(inside, 0.0), 0.0)
 
 
 @dataclass
@@ -210,8 +221,19 @@ def joint_fit(
     A: np.ndarray,
     fit_A: bool,
     ridge: float = 20.0,
+    face_sigma_deg: float = 20.0,
+    roll_sigma_deg: float = 5.0,
+    occlusion_mm: float = 10.0,
 ):
     """Nonlinear least squares over A (optional) and group poses; angular residuals.
+
+    Each free screen also gets a weak physical prior: its normal points roughly
+    at the eye, and its u axis is level with the camera's x axis (the lid hinge;
+    monitors stand upright on the same desk as the laptop). Without it, a
+    compressed net pitch response is "explained" by tipping the screen ~70°
+    back, which fits the gaze angles but lands most hits off-screen.
+    And no target can sit behind the built-in panel: the user saw it.
+    Prior residuals are weighted like one target presentation's worth of frames.
 
     Updates screens' poses in place; returns (A, final cost).
     """
@@ -233,6 +255,13 @@ def joint_fit(
     sids = np.unique(s.screen)
     masks = {sid: s.screen == sid for sid in sids}
     X = np.hstack([s.raw, np.ones((len(s), 1))])
+    free = [sid for g in groups for sid in g.offsets]
+    eye = s.o.mean(axis=0)
+    occluders = [sc for sc in screens.values() if sc.builtin]
+    tids = {sid: np.unique(s.target_idx[masks[sid]]) for sid in free if sid in masks}
+    tgt_uv = {sid: np.array([s.uv[s.target_idx == t][0] for t in tids[sid]]) for sid in tids}
+    # one presentation = many correlated frames; the prior should count as one
+    w_prior = 3.0 * np.sqrt(len(s) / max(len(np.unique(s.target_idx)), 1))
 
     def resid(p):
         A_, poses = unpack(p)
@@ -246,6 +275,20 @@ def joint_fit(
         r = [(pred - tgt).ravel()]
         if fit_A:
             r.append(np.sqrt(ridge) * (A_[:, :2] - np.eye(2)).ravel())
+        for sid in free:
+            R, t = poses[sid]
+            w, h = screens[sid].size_mm
+            c = R @ np.array([w / 2, h / 2, 0.0]) + t
+            to_screen = (c - eye) / np.linalg.norm(c - eye)
+            face = np.degrees(np.arccos(np.clip(R[:, 2] @ to_screen, -1, 1)))
+            roll = np.degrees(np.arcsin(np.clip(R[1, 0], -1, 1)))
+            r.append(w_prior * np.array([face / face_sigma_deg, roll / roll_sigma_deg]))
+            if sid not in tgt_uv:
+                continue
+            # the user saw every target, so none can sit behind the laptop lid
+            P = tgt_uv[sid] @ R[:, :2].T + t
+            for oc in occluders:
+                r.append(w_prior * occlusion_depth(oc, eye, P) / occlusion_mm)
         return np.concatenate(r)
 
     p0 = [A.ravel()] if fit_A else []
@@ -305,6 +348,29 @@ def pick_anchor(screens: dict[str, Screen]) -> str:
 # ---------------------------------------------------------------- top level
 
 
+def target_errors(s: Samples, A: np.ndarray, screens: dict[str, Screen]) -> dict[int, float]:
+    """Median angular error (deg) per target presentation."""
+    P = np.stack([screens[sid].point_cam(u, v) for sid, (u, v) in zip(s.screen, s.uv)])
+    want = (P - s.o) / np.linalg.norm(P - s.o, axis=1, keepdims=True)
+    ang = np.degrees(np.arccos(np.clip(np.sum(want * gaze_dir(A, s.raw, s.fR), axis=1), -1, 1)))
+    return {int(t): float(np.median(ang[s.target_idx == t])) for t in np.unique(s.target_idx)}
+
+
+def outlier_targets(s: Samples, A: np.ndarray, screens: dict[str, Screen], floor_deg: float = 8.0) -> dict[int, float]:
+    """Targets whose median error is far beyond the rest; keeps >= 4 per screen."""
+    err = target_errors(s, A, screens)
+    e = np.array(list(err.values()))
+    med = np.median(e)
+    cut = max(floor_deg, med + 4 * 1.4826 * np.median(np.abs(e - med)))
+    bad = {}
+    for sid in np.unique(s.screen):
+        tids = np.unique(s.target_idx[s.screen == sid])
+        worst = sorted((t for t in tids if err[t] > cut), key=lambda t: -err[t])
+        for t in worst[: max(0, len(tids) - 4)]:
+            bad[int(t)] = round(err[t], 1)
+    return bad
+
+
 class NotCalibrated(RuntimeError):
     pass
 
@@ -323,50 +389,66 @@ def calibrate(recs: list[dict], mons: list[Monitor], cfg: dict, mode: str, refit
     report: dict = {"mode": mode, "profile_key": key, "frames": len(s)}
 
     A_prev = load_user()
-    lap = s.subset(s.screen == bid)
     fit_A = mode == "full" or refit_user or A_prev is None
-    if fit_A and len(np.unique(lap.target_idx)) >= 4:
-        A = fit_A_linear(lap, screens)
-    else:
-        A = A_prev if A_prev is not None else A_IDENTITY.copy()
-
-    groups: list[Group] = []
     present = [sid for sid in ext_ids if np.any(s.screen == sid)]
     if mode == "full":
         missing = set(ext_ids) - set(present)
         if missing:
             raise RuntimeError(f"full calibration needs targets on every monitor; missing {missing}")
-        for sid in ext_ids:
-            R, t = init_pose_pnp(s.subset(s.screen == sid), A, screens[sid].size_mm)
-            groups.append(Group(R, t, {sid: (np.eye(3), np.zeros(3))}))
-        A, cost = joint_fit(s, screens, groups, A, fit_A=fit_A)
     elif ext_ids:
         prof = load_profile(key)
         if prof is None:
             raise NotCalibrated(f"no profile for this monitor set; run a full collect first ({key})")
-        anchor = prof["anchor"]
-        offsets = {sid: _pose_load(prof["monitors"][sid]) for sid in ext_ids}
-        cands = []
-        cur = load_current()
-        if cur and cur.get("profile_key") == key:
-            cands.append(_pose_load(cur))
-        for sid in present:
-            R, t = init_pose_pnp(s.subset(s.screen == sid), A, screens[sid].size_mm)
-            cands.append(compose(R, t, *invert(*offsets[sid])))
-        if not cands:
+        if not present:
             raise RuntimeError("quick calibration needs targets on at least one external monitor")
-        best = None
-        for R0, t0 in cands:
-            trial = {k: Screen(**{**v.__dict__}) for k, v in screens.items()}
-            g = Group(R0, t0, offsets)
-            A_fit, cost = joint_fit(s, trial, [g], A, fit_A=refit_user)
-            if best is None or cost < best[1]:
-                best = (A_fit, cost, trial, g)
-        A, cost, screens, g = best
-        groups = [g]
-        report["anchor"] = anchor
-    else:
-        cost = 0.0
+        report["anchor"] = prof["anchor"]
+
+    def fit(s):
+        lap = s.subset(s.screen == bid)
+        if fit_A and len(np.unique(lap.target_idx)) >= 4:
+            A = fit_A_linear(lap, screens)
+        else:
+            A = A_prev if A_prev is not None else A_IDENTITY.copy()
+        if mode == "full" and ext_ids:
+            groups = []
+            for sid in ext_ids:
+                sub = s.subset(s.screen == sid)
+                best = None
+                for R0, t0 in init_pose_candidates(sub, A, screens[sid].size_mm):
+                    g = Group(R0, t0, {sid: (np.eye(3), np.zeros(3))})
+                    trial = {sid: Screen(**{**screens[sid].__dict__})}
+                    _, c = joint_fit(sub, trial, [g], A, fit_A=False)
+                    if best is None or c < best[0]:
+                        best = (c, g)
+                groups.append(best[1])
+            A, cost = joint_fit(s, screens, groups, A, fit_A=fit_A)
+            return A, cost, screens
+        if ext_ids:
+            offsets = {sid: _pose_load(prof["monitors"][sid]) for sid in ext_ids}
+            cands = []
+            cur = load_current()
+            if cur and cur.get("profile_key") == key:
+                cands.append(_pose_load(cur))
+            for sid in present:
+                for R, t in init_pose_candidates(s.subset(s.screen == sid), A, screens[sid].size_mm):
+                    cands.append(compose(R, t, *invert(*offsets[sid])))
+            best = None
+            for R0, t0 in cands:
+                trial = {k: Screen(**{**v.__dict__}) for k, v in screens.items()}
+                A_fit, cost = joint_fit(s, trial, [Group(R0, t0, offsets)], A, fit_A=refit_user)
+                if best is None or cost < best[1]:
+                    best = (A_fit, cost, trial)
+            return best
+        return A, 0.0, screens
+
+    A, cost, screens = fit(s)
+    bad = outlier_targets(s, A, screens)
+    if bad:
+        # e.g. the user looked late, looked away, or leaned out of frame
+        report["dropped_targets"] = bad
+        s = s.subset(~np.isin(s.target_idx, list(bad)))
+        report["frames"] = len(s)
+        A, cost, screens = fit(s)
 
     report["cost"] = cost
     report["A"] = A.round(4).tolist()

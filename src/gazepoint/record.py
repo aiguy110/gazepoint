@@ -78,5 +78,11 @@ def load(path: Path) -> tuple[dict, list[dict]]:
     return meta, recs
 
 
+def labelled(meta: dict, recs: list[dict]) -> list[dict]:
+    """Frames with a target, minus presentations collect rejected as not fixated."""
+    bad = set(meta.get("rejected_targets", []))
+    return [r for r in recs if r.get("target") and r["target"].get("index") not in bad]
+
+
 def monitors_of(meta: dict) -> list[Monitor]:
     return [Monitor(**m) for m in meta["monitors"]]

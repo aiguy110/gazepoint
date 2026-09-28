@@ -73,6 +73,9 @@ different external monitors.
 `sessions/<ts>-collect|usage/` holds `session.json` (monitors, K, config
 snapshot), `samples.jsonl` (`{seq, t, frame, target, obs}`), and
 `frames/*.jpg` (raw frames, kept so they can be reprocessed with new models).
+Collect presentations that weren't a steady fixation are listed in
+`session.json`'s `rejected_targets`. Their frames are kept, but `calibrate` and
+`eval` skip them (`record.labelled`).
 `usage` sessions come from `run`. When the key is released, the latch frames
 are labelled with the final cursor position. Clicks logged with `--log-clicks`
 (X11 only) are stored with `obs: null` until `gazepoint reprocess` fills them

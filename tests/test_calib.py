@@ -103,3 +103,29 @@ def test_full_then_quick():
     by = {s.id: s for s in rt}
     for sid in moved:
         assert np.allclose(by[sid].point_cam(10, 10), screens2[sid].point_cam(10, 10), atol=1e-3)
+
+
+def test_fixation_problem():
+    from gazepoint.collect import fixation_problem
+
+    cc = CFG["collect"]
+    rng = np.random.default_rng(0)
+    steady = rng.normal([10.0, 20.0], 3.0, (15, 2))
+    assert fixation_problem(steady, cc) is None
+    late = np.vstack([steady[:10], rng.normal([-15.0, 20.0], 3.0, (5, 2))])  # saccaded late
+    assert fixation_problem(late, cc) is not None
+    assert fixation_problem(np.vstack([steady[:8], steady[8:] - [0, 25]]), cc) is not None
+    assert "face frames" in fixation_problem(steady[:3], cc)
+
+
+def test_occluded_monitor_not_placed_behind_lid():
+    """The dell's bottom edge is 60 mm above the camera, just clear of the lid: the fit
+    must not park it behind the built-in panel."""
+    poses = ext_poses()
+    recs = [r for r in synth(poses, per_screen=9) if r["target"]["monitor"] != EXT2.id]
+    A, screens, rep = calib.calibrate(recs, [LAPTOP, EXT], CFG, "full", False, "t")
+    lap, ext = screens[LAPTOP.id], screens[EXT.id]
+    eye = np.array([0, -40, 520.0])
+    P = np.array([ext.point_cam(u, v) for u in (0, EXT.width_mm) for v in (0, EXT.height_mm)])
+    assert calib.occlusion_depth(lap, eye, P).max() < 5.0
+    assert rep["eval"][f"dell [{EXT.id}]"]["wrong_screen"] < 0.05

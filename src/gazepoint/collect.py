@@ -3,6 +3,9 @@ with where the user was looking.
 
 One fullscreen window per monitor. Each target shrinks over settle_ms (the user
 saccades to it and settles), then holds for capture_ms while frames are recorded.
+If the raw gaze during the capture doesn't look like a fixation, the presentation
+is listed in session.json's rejected_targets (frames kept, calibration skips them)
+and the point is queued again at the end.
 After the last target the session is calibrated in place and the windows switch to
 a live gaze view (G skips straight there using the saved calibration).
 """
@@ -34,6 +37,21 @@ def grid(n: int) -> list[tuple[float, float]]:
     k = int(np.ceil(np.sqrt(n)))
     pts = [(lo + (hi - lo) * i / (k - 1), lo + (hi - lo) * j / (k - 1)) for j in range(k) for i in range(k)]
     return pts[:n]
+
+
+def fixation_problem(gaze: list, cc: dict) -> str | None:
+    """Why one target's raw (yaw, pitch) samples don't look like a steady fixation, or None."""
+    if len(gaze) < cc["fixation_min_frames"]:
+        return f"only {len(gaze)} face frames"
+    g = np.asarray(gaze, dtype=np.float64)
+    spread = np.percentile(np.linalg.norm(g - np.median(g, axis=0), axis=1), 75)
+    if spread > cc["fixation_spread_deg"]:
+        return f"gaze scattered ({spread:.1f} deg)"
+    h = len(g) // 2
+    drift = np.linalg.norm(np.median(g[:h], axis=0) - np.median(g[h:], axis=0))
+    if drift > cc["fixation_drift_deg"]:
+        return f"gaze moved during capture ({drift:.1f} deg)"
+    return None
 
 
 def choose_mode(mons: list[Monitor]) -> str:
@@ -115,7 +133,9 @@ class Collector:
         self.face_ok = False
         self.stop = False
         self.aborted = False
-        self.per_target: dict[int, int] = {}
+        self.gaze: dict[int, list] = {}  # target index -> raw (yaw, pitch) per face frame
+        self.rejected: list[int] = []
+        self.retries: collections.Counter = collections.Counter()  # (monitor id, fx, fy) -> re-shows
         self.phase = "intro"  # intro -> targets -> calibrating -> view
         self.calib_thread: threading.Thread | None = None
         self.calib_result: dict | Exception | None = None
@@ -139,7 +159,7 @@ class Collector:
             if target is not None:
                 self.writer.add(frame, seq, t, target, obs.to_json() if obs else None)
                 if obs:
-                    self.per_target[target["index"]] = self.per_target.get(target["index"], 0) + 1
+                    self.gaze.setdefault(target["index"], []).append(obs.gaze_raw)
             view = self.view
             if view and obs:
                 hit = gaze_px(*view, obs)
@@ -263,8 +283,7 @@ class Collector:
             else:
                 with self.lock:
                     self.current = None
-                if not self.face_ok and self.per_target.get(i, 0) == 0:
-                    print(f"target {i}: no face frames")
+                self._judge(i, m, fx, fy)
                 self.root.after(1, self._show, i + 1)
                 return
             if not self.face_ok:
@@ -272,6 +291,22 @@ class Collector:
             self.root.after(16, frame)
 
         frame()
+
+    def _judge(self, i: int, m: Monitor, fx: float, fy: float):
+        with self.lock:
+            gaze = list(self.gaze.get(i, []))
+        why = fixation_problem(gaze, self.cfg["collect"])
+        if why is None:
+            return
+        self.rejected.append(i)
+        self.writer.update_meta(rejected_targets=self.rejected)
+        key = (m.id, fx, fy)
+        if self.retries[key] < self.cfg["collect"]["fixation_retries"]:
+            self.retries[key] += 1
+            self.targets.append((m, fx, fy))
+            print(f"target {i}: {why}; showing it again later")
+        else:
+            print(f"target {i}: {why}; out of retries, skipping")
 
     # ------------------------------------------------------------ calibrate + gaze view
 
@@ -359,7 +394,8 @@ def collect(cfg: dict, mode: str = "auto", rounds: int = 1, points: int | None =
         shutil.rmtree(col.writer.dir)
         print("no frames recorded; session discarded")
         return None
-    got = sum(1 for v in col.per_target.values() if v)
-    print(f"recorded {col.writer.count} frames, {got}/{len(col.targets)} targets with face frames")
+    good = len(col.targets) - len(col.rejected)
+    print(f"recorded {col.writer.count} frames, {good}/{len(col.targets)} target presentations kept"
+          + (f" ({len(col.rejected)} rejected as not fixated)" if col.rejected else ""))
     print(f"data: {col.writer.dir}")
     return col.writer.id
