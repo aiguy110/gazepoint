@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import collections
+import glob
+import os
+import re
 import threading
 import time
 
@@ -12,17 +15,37 @@ import numpy as np
 from .tracker import intrinsics
 
 
+def resolve_index(index: int | str) -> int | str:
+    """V4L2 index for an int, a /dev/videoN path, or a device name
+    (e.g. "libcamera Camera", as v4l2-ctl --list-devices shows it; loopback
+    numbers are allocated at boot, so names are the stable choice). Anything
+    else is returned unchanged and treated as a video file."""
+    if isinstance(index, int):
+        return index
+    m = re.fullmatch(r"/dev/video(\d+)", index)
+    if m:
+        return int(m.group(1))
+    if os.path.isfile(index):
+        return index
+    for path in sorted(glob.glob("/sys/class/video4linux/video*/name")):
+        with open(path) as f:
+            if f.read().strip() == index:
+                return int(re.search(r"video(\d+)/name$", path).group(1))
+    raise RuntimeError(f"no video file or V4L2 device named {index!r}")
+
+
 class Camera:
     def __init__(self, cfg: dict, history_s: float = 1.0):
         c = cfg["camera"]
-        # A string index is a video file, looped at its native rate (testing/replay).
-        self.is_file = isinstance(c["index"], str)
+        index = resolve_index(c["index"])
+        # A video file is looped at its native rate (testing/replay).
+        self.is_file = isinstance(index, str)
         if self.is_file:
-            self.cap = cv2.VideoCapture(c["index"])
+            self.cap = cv2.VideoCapture(index)
         else:
-            self.cap = cv2.VideoCapture(c["index"], cv2.CAP_V4L2)
+            self.cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         if not self.cap.isOpened():
-            raise RuntimeError(f"cannot open camera index {c['index']}")
+            raise RuntimeError(f"cannot open camera {c['index']!r}")
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*c["fourcc"]))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, c["width"])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, c["height"])

@@ -23,7 +23,7 @@ from pathlib import Path
 
 DEFAULTS: dict = {
     "camera": {
-        "index": 0,  # V4L2 index, or a video file path (looped) for testing
+        "index": 0,  # V4L2 index, /dev/videoN, device name, or a video file (looped, for testing)
         "width": 1280,
         "height": 720,
         "fps": 30,
