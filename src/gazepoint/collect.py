@@ -3,12 +3,17 @@ with where the user was looking.
 
 One fullscreen window per monitor. Each target shrinks over settle_ms (the user
 saccades to it and settles), then holds for capture_ms while frames are recorded.
+After the last target the session is calibrated in place and the windows switch to
+a live gaze view (G skips straight there using the saved calibration).
 """
 
 from __future__ import annotations
 
+import collections
 import random
+import shutil
 import threading
+import traceback
 import time
 import tkinter as tk
 
@@ -17,6 +22,7 @@ import numpy as np
 from . import calib, record
 from .camera import Camera
 from .monitors import Monitor, detect, profile_key
+from .run import clamp_desktop, gaze_px
 from .tracker import Tracker
 
 
@@ -61,9 +67,19 @@ def hide_cursor(window_ids: list[int]):
         return None
 
 
+def summarize(report: dict) -> str:
+    """Calibrate report -> one status line: median gaze error on each screen."""
+    errs = [f"{name.split(' [')[0]} {e['deg']['median']}°" for name, e in report["eval"].items() if e["deg"]]
+    line = "calibrated, median error: " + ", ".join(errs)
+    if "warning" in report:
+        line += "\nWARNING: " + report["warning"]
+    return line
+
+
 class Collector:
-    def __init__(self, cfg: dict, mode: str, rounds: int, points: int | None):
+    def __init__(self, cfg: dict, mode: str, rounds: int, points: int | None, do_calibrate: bool = True):
         self.cfg = cfg
+        self.do_calibrate = do_calibrate
         self.mons = detect()
         self.mode = choose_mode(self.mons) if mode == "auto" else mode
         cc = cfg["collect"]
@@ -100,6 +116,12 @@ class Collector:
         self.stop = False
         self.aborted = False
         self.per_target: dict[int, int] = {}
+        self.phase = "intro"  # intro -> targets -> calibrating -> view
+        self.calib_thread: threading.Thread | None = None
+        self.calib_result: dict | Exception | None = None
+        self.view: tuple | None = None  # (A, screens) once the gaze view is live
+        self.view_msg = ""
+        self.hits: collections.deque = collections.deque(maxlen=120)  # (t, desktop x, y)
 
     # ------------------------------------------------------------ worker
 
@@ -118,6 +140,12 @@ class Collector:
                 self.writer.add(frame, seq, t, target, obs.to_json() if obs else None)
                 if obs:
                     self.per_target[target["index"]] = self.per_target.get(target["index"], 0) + 1
+            view = self.view
+            if view and obs:
+                hit = gaze_px(*view, obs)
+                if hit:
+                    with self.lock:
+                        self.hits.append((t, hit[1], hit[2]))
 
     # ------------------------------------------------------------ UI
 
@@ -134,7 +162,7 @@ class Collector:
             w.attributes("-fullscreen", True)
             c = tk.Canvas(w, background=cc["background"], highlightthickness=0)
             c.pack(fill="both", expand=True)
-            for seq in ("<space>", "<Escape>", "q"):
+            for seq in ("<space>", "<Escape>", "q", "g", "G"):
                 w.bind(seq, self._key)
             self.wins[m.id] = (w, c, m)
         root.update()
@@ -146,10 +174,8 @@ class Collector:
                 print(f"WARNING: window for {m.name} landed at {geoms[mid]}, expected {[m.x, m.y, m.w, m.h]}")
         self.writer.update_meta(window_geometry=geoms)
         self._xcursor = hide_cursor([c.winfo_id() for _, c, _ in self.wins.values()])
-        builtin = next(v for v in self.wins.values() if v[2].builtin)
-        builtin[0].focus_force()
+        self._builtin()[0].focus_force()
         self.root = root
-        self.started = False
         threading.Thread(target=self.worker, daemon=True).start()
         self._intro()
         root.mainloop()
@@ -158,39 +184,54 @@ class Collector:
             self._xcursor.close()
         return self.writer.id
 
+    def _builtin(self):
+        return next(v for v in self.wins.values() if v[2].builtin)
+
     def _key(self, ev):
         if ev.keysym in ("Escape", "q"):
-            print("aborted")
-            self.aborted = True
+            if self.phase in ("intro", "targets"):
+                print("aborted")
+                self.aborted = True
             self.root.quit()
-        elif ev.keysym == "space" and not self.started:
-            self.started = True
+        elif ev.keysym == "space" and self.phase == "intro":
+            self.phase = "targets"
             self._show(0)
+        elif ev.keysym in ("g", "G") and self.phase in ("intro", "targets"):
+            print("calibration skipped")
+            with self.lock:
+                self.current = None
+            self._view("calibration skipped, using the saved one")
 
     def _clear(self):
         for _, c, _ in self.wins.values():
             c.delete("all")
 
     def _intro(self):
-        if self.started:
+        if self.phase != "intro":
             return
         self._clear()
-        _, c, m = next(v for v in self.wins.values() if v[2].builtin)
+        _, c, m = self._builtin()
         n_ext = sum(1 for x in self.mons if not x.builtin)
         msg = (
             f"gazepoint collect  -  {self.mode} calibration, {len(self.targets)} targets, "
             f"{len(self.mons)} screen(s) ({n_ext} external)\n\n"
             "Look at each dot until it disappears.\n"
-            "Keep your head natural; it's fine (good, even) to shift around between dots.\n\n"
+            "Keep your head natural; it's fine (good, even) to shift around between dots.\n"
+            "Afterwards you'll see where it thinks you're looking.\n\n"
             f"Face: {'OK' if self.face_ok else 'NOT DETECTED'}\n\n"
-            "Space = start      Esc = abort"
+            "Space = start      G = skip calibration, show live gaze      Esc = abort"
         )
         c.create_text(m.w // 2, m.h // 2, text=msg, fill="white", font=("Sans", 16), justify="center")
         self.root.after(250, self._intro)
 
     def _show(self, i: int):
+        if self.phase != "targets":
+            return
         if i >= len(self.targets):
-            self.root.quit()
+            if self.do_calibrate:
+                self._calibrate()
+            else:
+                self.root.quit()
             return
         m, fx, fy = self.targets[i]
         _, c, _ = self.wins[m.id]
@@ -206,6 +247,8 @@ class Collector:
         settle, capture = cc["settle_ms"] / 1000, cc["capture_ms"] / 1000
 
         def frame():
+            if self.phase != "targets":
+                return
             el = time.monotonic() - t0
             self._clear()
             if el < settle:
@@ -230,24 +273,93 @@ class Collector:
 
         frame()
 
+    # ------------------------------------------------------------ calibrate + gaze view
+
+    def _calibrate(self):
+        from .cli import run_calibrate
+
+        self.phase = "calibrating"
+        self._clear()
+        _, c, m = self._builtin()
+        c.create_text(m.w // 2, m.h // 2, text="Calibrating...", fill="white", font=("Sans", 20))
+
+        def fit():
+            try:
+                self.calib_result = run_calibrate(self.cfg, self.writer.id, self.mode, refit_user=False)
+            except Exception as e:  # noqa: BLE001 - reported in the UI
+                traceback.print_exc()
+                self.calib_result = e
+
+        self.calib_thread = threading.Thread(target=fit, name="calibrate")
+        self.calib_thread.start()
+        self._await_calibration()
+
+    def _await_calibration(self):
+        if self.calib_thread.is_alive():
+            self.root.after(100, self._await_calibration)
+            return
+        r = self.calib_result
+        if isinstance(r, Exception):
+            self._view(f"calibration FAILED: {r}\nshowing the saved calibration instead")
+        else:
+            self._view(summarize(r))
+
+    def _view(self, msg: str):
+        try:
+            self.view = calib.load_runtime(self.mons, self.cfg)
+        except calib.NotCalibrated as e:
+            msg += f"\nno usable calibration: {e}"
+        self.phase = "view"
+        self.view_msg = msg
+        self._draw_view()
+
+    def _draw_view(self):
+        """Blue trail = raw gaze hits over the last 0.5 s. White ring = their median over
+        latch_ms, i.e. where `gazepoint run` would jump if you pressed the hotkey now."""
+        now = time.monotonic()
+        with self.lock:
+            hits = [h for h in self.hits if now - h[0] < 0.5]
+        self._clear()
+        for _, c, m in self.wins.values():
+            for _, x, y in hits:
+                lx, ly = x - m.x, y - m.y
+                if 0 <= lx < m.w and 0 <= ly < m.h:
+                    c.create_oval(lx - 3, ly - 3, lx + 3, ly + 3, fill="#6fa8dc", outline="")
+        latch = [(x, y) for t, x, y in hits if now - t < self.cfg["run"]["latch_ms"] / 1000]
+        if latch:
+            x, y, m = clamp_desktop(self.mons, *np.median(latch, axis=0))
+            _, c, _ = self.wins[m.id]
+            lx, ly = x - m.x, y - m.y
+            c.create_oval(lx - 16, ly - 16, lx + 16, ly + 16, outline="white", width=3)
+            c.create_oval(lx - 2, ly - 2, lx + 2, ly + 2, fill="white", outline="")
+        _, c, m = self._builtin()
+        status = self.view_msg
+        if self.view and not self.face_ok:
+            status += "\nface not detected"
+        c.create_text(m.w // 2, 30, text=status + "\n\nEsc = quit", fill="white", font=("Sans", 14),
+                      justify="center", anchor="n")
+        self.root.after(16, self._draw_view)
+
 
 def collect(cfg: dict, mode: str = "auto", rounds: int = 1, points: int | None = None, do_calibrate: bool = True):
-    col = Collector(cfg, mode, rounds, points)
+    col = Collector(cfg, mode, rounds, points, do_calibrate)
     print(f"session {col.writer.id}: mode={col.mode}, {len(col.targets)} targets")
     try:
         col.run()
     finally:
         col.stop = True
+        if col.calib_thread and col.calib_thread.is_alive():
+            print("waiting for calibration to finish...")
+            col.calib_thread.join()  # never leave calibration files half-written
         time.sleep(0.2)
         col.writer.close()
         col.cam.close()
         col.tracker.close()
+    if col.writer.count == 0:
+        shutil.rmtree(col.writer.dir)
+        print("no frames recorded; session discarded")
+        return None
     got = sum(1 for v in col.per_target.values() if v)
     print(f"recorded {col.writer.count} frames, {got}/{len(col.targets)} targets with face frames")
     print(f"data: {col.writer.dir}")
-    if col.aborted or not do_calibrate:
-        return col.writer.id
-    from .cli import run_calibrate
-
-    run_calibrate(cfg, col.writer.id, col.mode, refit_user=False)
     return col.writer.id

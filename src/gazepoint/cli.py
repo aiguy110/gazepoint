@@ -183,7 +183,7 @@ def main(argv=None):
     d.add_argument("--gaze", nargs="*", help=f"gaze models to fetch ({', '.join(models.GAZE_MODELS)})")
     sub.add_parser("monitors", help="print detected monitors and profile key")
     sub.add_parser("preview", help="webcam preview with gaze/head overlays")
-    c = sub.add_parser("collect", help="show fixation targets, record labelled frames, calibrate")
+    c = sub.add_parser("collect", help="show fixation targets, record labelled frames, calibrate, then show live gaze")
     c.add_argument("--mode", choices=["auto", "full", "quick"], default="auto",
                    help="full = new desk/user (fits constellation), quick = re-place known desk")
     c.add_argument("--rounds", type=int, default=1)

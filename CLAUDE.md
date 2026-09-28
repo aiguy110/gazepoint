@@ -47,6 +47,9 @@ different external monitors.
   that treats the eye as a pinhole camera and gaze vectors as bearings, then
   refined jointly. *Quick* (known monitor set, laptop moved) fits only the
   6-DoF T_cam←anchor from about 5 targets per screen. `auto` picks one.
+  After the last target, `collect` calibrates in place and switches to a live
+  gaze view: a trail of raw hits, plus a ring where `run` would latch. **G**
+  skips collection and uses the saved calibration.
 - Fit quality is judged in gaze space, not by parameter recovery: `A`'s scale
   trades off against screen depth, and that trade-off is harmless.
 
