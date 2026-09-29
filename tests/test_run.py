@@ -86,3 +86,32 @@ def test_no_face_explains_once(live, capsys):
     assert out.count("still waiting to jump: face not detected") == 1
     assert "before a gaze fix" in out
     assert live.pointer.moves == []
+
+
+def test_reaim_jumps_while_held(live):
+    t = 0.0
+    live.on_key(True, t)
+    for i in range(1, 8):
+        t += 1 / 30
+        live.step(None, t, i)
+    assert live.state == "held"
+    x0, _ = live.pointer.moves[-1]
+    live.tracker.P = live.screens[0].point_cam(250.0, 95.0)  # look further right
+    live.on_reaim(True, t)
+    assert live.state == "latching"
+    n = len(live.pointer.moves)
+    for i in range(8, 15):
+        t += 1 / 30
+        live.step(None, t, i)
+    assert live.state == "held"
+    x1, y1 = live.pointer.moves[n]
+    assert x1 > x0 + 500 and abs(y1 - 600) < 5  # jumped to the new gaze point
+    live.on_reaim(False, t)
+    assert live.state == "held"  # releasing the re-aim key changes nothing
+    live.on_key(False, t)
+    assert live.state == "idle"
+
+
+def test_reaim_ignored_when_idle(live):
+    live.on_reaim(True, 0.0)
+    assert live.state == "idle"

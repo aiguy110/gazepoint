@@ -48,6 +48,15 @@ hotkey = "KEY_RIGHTALT"
 gain_px_per_deg = 50
 ```
 
+With the Chocofi's gazepoint firmware (`aiguy110/miryoku_zmk`: holding the
+MOUSE thumb also holds F14, and `'` on that layer is F15):
+
+```toml
+[run]
+hotkey = "KEY_F14"
+reaim_key = "KEY_F15"   # jump to the gaze again mid-hold, e.g. to finish a drag
+```
+
 ## Getting data off the laptop
 
 Recorded sessions live in `~/.local/share/gazepoint/sessions`.

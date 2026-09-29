@@ -81,6 +81,9 @@ DEFAULTS: dict = {
     },
     "run": {
         "hotkey": "KEY_RIGHTCTRL",
+        # While the hotkey is held, pressing this jumps to the gaze again (e.g. to
+        # carry a drag to its destination). "" disables it.
+        "reaim_key": "",
         "latch_ms": 120,
         # Cursor px per degree of head rotation while the key is held.
         "gain_px_per_deg": 35.0,

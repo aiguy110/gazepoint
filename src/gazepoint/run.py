@@ -6,6 +6,7 @@ State machine (driven by camera frames):
   latching --------> held: warp to median hit (the anchor), remember head pose
   held: cursor = anchor + gain * (head delta)   (head angles One-Euro filtered)
   held --key up----> idle: log (latch frames, anchor, final cursor) as a label
+  held/latching --reaim key down--> latching: log the segment so far, latch again
 
 The final cursor position is where the user actually wanted to be, so each use
 produces a labelled sample for later recalibration/training.
@@ -74,7 +75,8 @@ class Live:
             print("click logging needs X11 (cursor position is not observable on Wayland); disabled")
             log_clicks = False
         self.pending_clicks: list = []
-        self.listener = InputListener(rc["hotkey"], self.on_key, self.on_click if log_clicks else None)
+        self.listener = InputListener(rc["hotkey"], self.on_key, self.on_click if log_clicks else None,
+                                      rc["reaim_key"], self.on_reaim)
 
     # ------------------------------------------------------------ logging
 
@@ -108,6 +110,15 @@ class Live:
             elif not down and self.state != "idle":
                 self._release()
 
+    def on_reaim(self, down: bool, t: float):
+        """Jump to the gaze again without letting go of the hotkey. Mouse buttons
+        held meanwhile stay held, so this carries a drag to its destination."""
+        with self.lock:
+            if down and self.state != "idle":
+                self._log_segment()
+                self.state, self.latch_t, self.latch, self.latch_warned = "latching", t, [], False
+                print("re-aim: reading gaze")
+
     def on_click(self, t: float):
         pos = self.pointer.position()
         item = self.cam.at(t - self.cfg["run"]["click_lookback_ms"] / 1000)
@@ -117,18 +128,22 @@ class Live:
 
     def _release(self):
         """Called with lock held."""
+        self._log_segment()
         if self.state == "held":
             print(f"hotkey up: cursor at ({self.pos[0]:.0f}, {self.pos[1]:.0f})")
         else:
             print("hotkey up before a gaze fix; cursor not moved")
+        self.state = "idle"
+        self.latch = []
+
+    def _log_segment(self):
+        """Label the latch frames with where the cursor ended up. Lock held."""
         if self.state == "held" and self.latch and self._writer():
             self.events += 1
             tgt = self._target(*self.pos, self.events, "release")
             extra = {"anchor_px": list(self.anchor), "event": self.events}
             for frame, obs, _hit in self.latch:
                 self.writer.add(frame, obs.seq, obs.t, tgt, obs.to_json(), **extra)
-        self.state = "idle"
-        self.latch = []
 
     def _latch_stalled(self, t: float, why: str):
         """Called with lock held: say once per press why the jump hasn't happened yet."""
@@ -173,7 +188,9 @@ class Live:
     def run(self):
         self.listener.start()
         kbds = ", ".join(d.name for d in self.listener.kbds)
-        print(f"ready: hold {self.cfg['run']['hotkey']} to point; listening on {kbds} (Ctrl-C to quit)")
+        rc = self.cfg["run"]
+        reaim = f", {rc['reaim_key']} to re-aim" if rc["reaim_key"] else ""
+        print(f"ready: hold {rc['hotkey']} to point{reaim}; listening on {kbds} (Ctrl-C to quit)")
         seq = 0
         n, t_rate = 0, time.monotonic()
         try:

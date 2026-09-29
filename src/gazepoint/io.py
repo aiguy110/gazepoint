@@ -112,8 +112,8 @@ def make_pointer(backend: str, mons: list[Monitor]):
 # ---------------------------------------------------------------- evdev input
 
 
-def input_devices(key_code: int):
-    """(keyboards having key_code, mice having BTN_LEFT) that we can read."""
+def input_devices(key_codes: set[int]):
+    """(keyboards having any of key_codes, mice having BTN_LEFT) that we can read."""
     from evdev import InputDevice, list_devices
     from evdev import ecodes as e
 
@@ -126,7 +126,7 @@ def input_devices(key_code: int):
         keys = dev.capabilities().get(e.EV_KEY, [])
         if dev.name == "gazepoint-pointer":
             dev.close()
-        elif key_code in keys:
+        elif key_codes & set(keys):
             kbds.append(dev)
         elif e.BTN_LEFT in keys:
             mice.append(dev)
@@ -140,26 +140,30 @@ def readable_input() -> bool:
 
 
 class InputListener(threading.Thread):
-    """Calls on_key(down: bool, t) for the hotkey and on_click(t) for left clicks.
+    """Calls on_key(down: bool, t) for the hotkey, on_reaim(down, t) for the
+    re-aim key (if any), and on_click(t) for left clicks.
 
-    Does not grab devices: the hotkey still reaches applications, so pick a key
+    Does not grab devices: the keys still reach applications, so pick ones
     whose lone press/release is harmless (Right Ctrl by default).
     """
 
-    def __init__(self, key_name: str, on_key: Callable, on_click: Callable | None = None):
+    def __init__(self, key_name: str, on_key: Callable, on_click: Callable | None = None,
+                 reaim_name: str = "", on_reaim: Callable | None = None):
         super().__init__(daemon=True, name="input")
         from evdev import ecodes as e
 
         self.e = e
         self.key_name = key_name
-        self.code = e.ecodes[key_name]
+        self.handlers = {e.ecodes[key_name]: on_key}
+        if reaim_name and on_reaim:
+            self.handlers[e.ecodes[reaim_name]] = on_reaim
         # The same key on the other side (KEY_RIGHTCTRL <-> KEY_LEFTCTRL): pressing it is
         # the usual reason the hotkey "does nothing", so say so once.
         other = key_name.replace("LEFT", "\0").replace("RIGHT", "LEFT").replace("\0", "RIGHT")
         self.sibling = (other, e.ecodes[other]) if other != key_name and other in e.ecodes else None
         self._hinted = False
-        self.on_key, self.on_click = on_key, on_click
-        self.kbds, self.mice = input_devices(self.code)
+        self.on_click = on_click
+        self.kbds, self.mice = input_devices(set(self.handlers))
         if not self.kbds:
             raise RuntimeError(
                 f"no readable keyboard with {key_name}; is your user in the 'input' group? "
@@ -170,7 +174,7 @@ class InputListener(threading.Thread):
     def _rescan(self, devs: dict):
         """Pick up keyboards that (re)connected since startup, e.g. Bluetooth after sleep."""
         known = {d.path for d in devs.values()}
-        kbds, mice = input_devices(self.code)
+        kbds, mice = input_devices(set(self.handlers))
         for d in kbds + mice:
             if d.path in known or (d in mice and not self.on_click):
                 d.close()
@@ -198,8 +202,9 @@ class InputListener(threading.Thread):
                     if ev.type != e.EV_KEY:
                         continue
                     t = time.monotonic()
-                    if ev.code == self.code and ev.value in (0, 1):
-                        self.on_key(ev.value == 1, t)
+                    handler = self.handlers.get(ev.code)
+                    if handler and ev.value in (0, 1):
+                        handler(ev.value == 1, t)
                     elif ev.code == e.BTN_LEFT and ev.value == 1 and self.on_click:
                         self.on_click(t)
                     elif self.sibling and ev.code == self.sibling[1] and ev.value == 1 and not self._hinted:

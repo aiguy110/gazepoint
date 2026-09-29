@@ -145,6 +145,9 @@ in. Models live in `models/`. User config lives in
   operator's ZMK keyboard uses home-row mods: Right Ctrl is a hold on the
   right pinky with a 200 ms tapping term, so expect that much lag before the
   hotkey registers.
+  The user's Chocofi (`aiguy110/miryoku_zmk`) instead sends F14 while its MOUSE
+  layer is held (no home-row-mod lag) and F15 as `reaim_key`; its MOUSE thumbs
+  click left (RET), right (BSPC), middle (DEL).
   `scripts/setup-input-perms.sh` is needed for `/dev/input` and `/dev/uinput`.
 
 ## Roadmap
