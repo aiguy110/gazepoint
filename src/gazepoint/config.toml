@@ -123,12 +123,15 @@ scroll_deadzone_deg = 0.6
 # Wheel detents per second per degree beyond the dead zone. High-resolution
 # wheel events make fractions of a detent useful in applications that support
 # smooth scrolling; X11 core-wheel fallback accumulates them into whole steps.
-scroll_vertical_steps_per_s_per_deg = 3.0
-scroll_horizontal_steps_per_s_per_deg = 2.0
+# (speed = steps_per_s_per_deg * degrees_past_dead_zone ** scroll_curve)
+scroll_vertical_steps_per_s_per_deg = 0.5
+scroll_horizontal_steps_per_s_per_deg = 0.33
 # Exponent on displacement beyond the dead zone. Values above 1 give precise
-# control near neutral while allowing large motions to accelerate.
-scroll_curve = 1.5
-scroll_max_steps_per_s = 24.0
+# control near neutral while allowing large motions to accelerate. With the
+# defaults, vertical speed is 0.5/s at 1°, 4/s at 2°, 13.5/s at 3°, and hits
+# the cap just past 4°.
+scroll_curve = 3.0
+scroll_max_steps_per_s = 40.0
 # Exponential smoothing time constant for scroll velocity (0 disables).
 scroll_tau_ms = 100
 # Multiplier applied while slow_key is held.
