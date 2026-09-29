@@ -60,6 +60,10 @@ class X11Pointer:
         p = self.root.query_pointer()
         return p.root_x, p.root_y
 
+    def move_rel(self, dx: float, dy: float):
+        x, y = self.position()
+        self.move(x + dx, y + dy)
+
     def close(self):
         self.d.close()
 
@@ -86,7 +90,14 @@ class UInputPointer:
             },
             name="gazepoint-pointer",
         )
-        time.sleep(0.3)  # let the compositor pick the device up
+        # A second, relative device for moving the pointer from wherever it is
+        # (its position can't be read on Wayland). The compositor applies its
+        # pointer acceleration to this one.
+        self.rel = UInput(
+            {e.EV_KEY: [e.BTN_LEFT], e.EV_REL: [e.REL_X, e.REL_Y]}, name="gazepoint-pointer-rel"
+        )
+        self.frac = [0.0, 0.0]
+        time.sleep(0.3)  # let the compositor pick the devices up
 
     def move(self, x: float, y: float):
         bx, by, bw, bh = self.bbox
@@ -99,8 +110,21 @@ class UInputPointer:
     def position(self):
         return None  # not observable on Wayland
 
+    def move_rel(self, dx: float, dy: float):
+        """Relative motion in (roughly, after acceleration) px; carries fractions over."""
+        self.frac[0] += dx
+        self.frac[1] += dy
+        ix, iy = int(self.frac[0]), int(self.frac[1])
+        if ix or iy:
+            self.frac[0] -= ix
+            self.frac[1] -= iy
+            self.rel.write(self.e.EV_REL, self.e.REL_X, ix)
+            self.rel.write(self.e.EV_REL, self.e.REL_Y, iy)
+            self.rel.syn()
+
     def close(self):
         self.ui.close()
+        self.rel.close()
 
 
 def make_pointer(backend: str, mons: list[Monitor]):
@@ -124,7 +148,7 @@ def input_devices(key_codes: set[int]):
         except OSError:
             continue
         keys = dev.capabilities().get(e.EV_KEY, [])
-        if dev.name == "gazepoint-pointer":
+        if dev.name.startswith("gazepoint-pointer"):
             dev.close()
         elif key_codes & set(keys):
             kbds.append(dev)

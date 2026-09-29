@@ -1,12 +1,19 @@
 """Live mode: hold the hotkey -> cursor jumps to gaze, head motion refines.
 
-State machine (driven by camera frames):
+State machine (driven by camera frames and gaze results):
 
-  idle --key down--> latching: gather gaze hits for latch_ms
+  idle --key down--> latching: gather gaze hits for latch_ms          (aim_mode jump)
+  idle --key down--> held, anchored at the current cursor, no jump    (aim_mode anchor)
   latching --------> held: warp to median hit (the anchor), remember head pose
   held: cursor = anchor + gain * (head delta)   (head angles One-Euro filtered)
   held --key up----> idle: log (latch frames, anchor, final cursor) as a label
-  held/latching --reaim key down--> latching: log the segment so far, latch again
+  held/latching --reaim key down--> latching on the gaze hits from the latch_ms
+      *before* the press (jumps at once if there are any); logs the segment so far
+
+In anchor mode on Wayland the cursor position can't be read, so unless
+gazepoint put it where it is, head motion moves it by relative steps until the
+first jump. With run.gaze_thread the gaze net runs on a worker thread
+(GazeWorker) on the newest frame, and gaze hits arrive at the net's own rate.
 
 The final cursor position is usually where the user wanted to be, so each use
 produces a labelled sample (samples.jsonl) for later recalibration/training.
@@ -15,7 +22,10 @@ raw stream in events.jsonl, from which labels can be rederived offline:
 
   session  t, wall            clock alignment (wall = time.time() at monotonic t)
   frame    t, seq, state, obs, gaze [x, y] (current calibration), cursor
+           (obs has gaze_raw None when the net didn't run on this frame here)
+  gaze     t, seq, obs, gaze   (gaze_thread only: net results, t = capture time)
   key      t, key (aim|reaim|slow), down, state
+  anchor   t, cursor (None if unknown: moving relatively)   (anchor mode)
   jump     t, anchor, n (gaze frames in the median)
   button   t, dev, button, down, cursor, cursor_trusted, state
   wheel    t, dev, dx|dy          touch  t, dev, down
@@ -33,6 +43,7 @@ from __future__ import annotations
 import collections
 import threading
 import time
+import traceback
 
 import numpy as np
 
@@ -67,6 +78,40 @@ def clamp_desktop(mons: list[Monitor], x: float, y: float) -> tuple[float, float
     return best[1], best[2], best[3]
 
 
+class GazeWorker(threading.Thread):
+    """Runs the gaze net on the newest submitted frame; older ones are dropped."""
+
+    def __init__(self, tracker: Tracker, on_gaze):
+        super().__init__(daemon=True, name="gaze")
+        self.tracker, self.on_gaze = tracker, on_gaze
+        self.cond = threading.Condition()
+        self.slot = None
+        self.stopped = False
+
+    def submit(self, frame, pending):
+        with self.cond:
+            self.slot = (frame, pending)
+            self.cond.notify()
+
+    def stop(self):
+        with self.cond:
+            self.stopped = True
+            self.cond.notify()
+
+    def run(self):
+        while True:
+            with self.cond:
+                while self.slot is None and not self.stopped:
+                    self.cond.wait()
+                if self.stopped:
+                    return
+                (frame, p), self.slot = self.slot, None
+            try:
+                self.on_gaze(frame, self.tracker.gaze(p))
+            except Exception:
+                traceback.print_exc()
+
+
 class Live:
     def __init__(self, cfg: dict, log_clicks: bool | None = None):
         self.cfg = cfg
@@ -75,6 +120,7 @@ class Live:
         self.A, self.screens = calib.load_runtime(self.mons, cfg)
         self.cam = Camera(cfg)
         self.tracker = Tracker(cfg, self.cam.K)
+        self.worker = GazeWorker(self.tracker, self.on_gaze) if rc["gaze_thread"] else None
         self.pointer = make_pointer(rc["pointer_backend"], self.mons)
         self.f_yaw = OneEuro(rc["one_euro_min_cutoff"], rc["one_euro_beta"])
         self.f_pitch = OneEuro(rc["one_euro_min_cutoff"], rc["one_euro_beta"])
@@ -86,16 +132,21 @@ class Live:
             log_clicks = False
         self.listener = InputListener(rc["hotkey"], self.on_key, self.on_click if log_clicks else None,
                                       rc["reaim_key"], self.on_reaim,
-                                      self.on_pointer if rc["log_usage"] else None,
+                                      # Anchor mode needs to know when another device moves the pointer.
+                                      self.on_pointer if rc["log_usage"] or rc["aim_mode"] == "anchor" else None,
                                       rc["slow_key"], self.on_slow)
 
     def _init_state(self):
         rc = self.cfg["run"]
         self.state = "idle"
         self.latch_t = 0.0
+        self.latch_from = 0.0  # gaze hits captured from here on count toward the jump
+        self.preroll = False  # latch on hits from before the press: jump as soon as there are any
         self.latch: list = []  # (frame, obs, hit)
         self.latch_warned = False
-        self.anchor = None
+        self.recent = collections.deque()  # (frame, obs, hit) gaze results, last ~latch_ms + 0.5 s
+        self.anchor = None  # None while held = cursor position unknown, moving relatively
+        self.rel_prev = None  # head angles at the last relative move
         self.head0 = None
         self.angles = None  # latest filtered (yaw, pitch)
         self.slow = False  # slow-gain key held
@@ -145,14 +196,37 @@ class Live:
 
     # ------------------------------------------------------------ input callbacks
 
+    def _start_latch(self, t: float, preroll: bool):
+        """Lock held."""
+        self.state, self.latch_t, self.latch, self.latch_warned = "latching", t, [], False
+        self.preroll = preroll
+        self.latch_from = t - self.cfg["run"]["latch_ms"] / 1000 if preroll else t
+        self._try_jump(t)
+
     def on_key(self, down: bool, t: float):
         with self.lock:
             self._event({"type": "key", "t": t, "key": "aim", "down": down, "state": self.state})
             if down and self.state == "idle":
-                self.state, self.latch_t, self.latch, self.latch_warned = "latching", t, [], False
-                print("hotkey down: reading gaze")
+                if self.cfg["run"]["aim_mode"] == "anchor":
+                    self._anchor_here(t)
+                else:
+                    self._start_latch(t, preroll=False)
+                    print("hotkey down: reading gaze")
             elif not down and self.state != "idle":
                 self._release()
+
+    def _anchor_here(self, t: float):
+        """Anchor mode: start moving the cursor from where it is. Lock held."""
+        pos = self.pointer.position()
+        if pos is None and self.pos is not None and not self.moved_by_other:
+            pos = self.pos  # Wayland, but nothing else has moved it since we put it there
+        self.state, self.latch = "held", []
+        self.recent.clear()  # gaze from before the press predates this hold
+        self.anchor = self.pos = tuple(pos) if pos else None
+        self.head0 = self.rel_prev = self.angles
+        self._event({"type": "anchor", "t": t, "cursor": list(pos) if pos else None})
+        where = f"at ({pos[0]:.0f}, {pos[1]:.0f})" if pos else "(position unknown: moving relatively)"
+        print(f"hotkey down: head moves the cursor {where}")
 
     def on_reaim(self, down: bool, t: float):
         """Jump to the gaze again without letting go of the hotkey. Mouse buttons
@@ -161,8 +235,8 @@ class Live:
             self._event({"type": "key", "t": t, "key": "reaim", "down": down, "state": self.state})
             if down and self.state != "idle":
                 self._log_segment()
-                self.state, self.latch_t, self.latch, self.latch_warned = "latching", t, [], False
                 print("re-aim: reading gaze")
+                self._start_latch(t, preroll=True)
 
     def on_slow(self, down: bool, t: float):
         """Hold for the low head gain. Re-anchors at the current cursor so the
@@ -170,7 +244,7 @@ class Live:
         with self.lock:
             self._event({"type": "key", "t": t, "key": "slow", "down": down, "state": self.state})
             self.slow = down
-            if self.state == "held" and self.angles:
+            if self.state == "held" and self.angles and self.anchor is not None:
                 self.anchor, self.head0 = self.pos, self.angles
 
     def on_pointer(self, rec: dict):
@@ -199,8 +273,10 @@ class Live:
     def _release(self):
         """Called with lock held."""
         self._log_segment()
-        if self.state == "held":
+        if self.state == "held" and self.anchor is not None:
             print(f"hotkey up: cursor at ({self.pos[0]:.0f}, {self.pos[1]:.0f})")
+        elif self.state == "held":
+            print("hotkey up")
         else:
             print("hotkey up before a gaze fix; cursor not moved")
         self.state = "idle"
@@ -223,44 +299,87 @@ class Live:
 
     # ------------------------------------------------------------ main loop
 
+    def _gaze_wanted(self) -> bool:
+        return self.cfg["run"]["aim_mode"] != "anchor" or self.state != "idle"
+
     def step(self, frame, t, seq):
-        obs = self.tracker.process(frame, t, seq)
-        if obs is None:
+        p = self.tracker.head(frame, t, seq)
+        if p is None:
             with self.lock:
                 self._latch_stalled(t, "face not detected")
                 self._record_frame(frame, t, seq, None, None)
             return
-        yaw = self.f_yaw(obs.head_yaw, t)
-        pitch = self.f_pitch(obs.head_pitch, t)
-        rc = self.cfg["run"]
+        yaw = self.f_yaw(p.obs.head_yaw, t)
+        pitch = self.f_pitch(p.obs.head_pitch, t)
+        obs, hit = p.obs, None
+        want = self._gaze_wanted()
+        if want and not self.worker:
+            obs = self.tracker.gaze(p)
+            hit = gaze_px(self.A, self.screens, obs)
+        with self.lock:
+            self.angles = (yaw, pitch)
+            if obs.gaze_raw is not None:
+                self._add_gaze(frame, obs, hit)
+            self._follow_head()
+            self._record_frame(frame, t, seq, obs, hit)
+        if want and self.worker:
+            self.worker.submit(frame, p)
+
+    def on_gaze(self, frame, obs):
+        """A gaze result from the worker thread."""
         hit = gaze_px(self.A, self.screens, obs)
         with self.lock:
-            self._step_locked(frame, t, seq, obs, hit, yaw, pitch, rc)
-            self._record_frame(frame, t, seq, obs, hit)
+            if self._gaze_wanted():
+                self._add_gaze(frame, obs, hit)
+                if self._writer():
+                    self.writer.event({"type": "gaze", "t": obs.t, "seq": obs.seq, "obs": obs.to_json(),
+                                       "gaze": [hit[1], hit[2]] if hit else None})
 
-    def _step_locked(self, frame, t, seq, obs, hit, yaw, pitch, rc):
-        self.angles = (yaw, pitch)
+    def _add_gaze(self, frame, obs, hit):
+        """Lock held."""
+        self.recent.append((frame, obs, hit))
+        while self.recent and self.recent[0][1].t < obs.t - self.cfg["run"]["latch_ms"] / 1000 - 0.5:
+            self.recent.popleft()
         if self.state == "latching":
-            if hit:
-                self.latch.append((frame, obs, hit))
-            else:
-                self._latch_stalled(t, "gaze misses every screen")
-            if t - self.latch_t >= rc["latch_ms"] / 1000 and self.latch:
-                xs = np.array([[h[1], h[2]] for _, _, h in self.latch])
-                self.anchor = tuple(np.median(xs, axis=0))
-                self.head0 = (yaw, pitch)
-                self.state = "held"
-                x, y, m = clamp_desktop(self.mons, *self.anchor)
-                self.pos = (x, y)
-                self._move(*self.pos)
-                self._event({"type": "jump", "t": t, "anchor": [x, y], "n": len(self.latch)})
-                print(f"jump to ({x:.0f}, {y:.0f}) on {m.name}, median of {len(self.latch)} gaze frames")
-        elif self.state == "held":
-            g = rc["gain_slow_px_per_deg"] if self.slow else rc["gain_px_per_deg"]
-            x = self.anchor[0] + g * (yaw - self.head0[0])
-            y = self.anchor[1] - g * (pitch - self.head0[1])
-            self.pos = clamp_desktop(self.mons, x, y)[:2]
-            self._move(*self.pos)
+            if not hit:
+                self._latch_stalled(obs.t, "gaze misses every screen")
+            self._try_jump(obs.t)
+
+    def _try_jump(self, t: float):
+        """Jump to the median gaze hit once the latch window is complete (or, for
+        a preroll latch, as soon as it has any hits). Lock held."""
+        rc = self.cfg["run"]
+        hits = [r for r in self.recent if r[1].t >= self.latch_from and r[2]]
+        if not hits or not (self.preroll or t - self.latch_t >= rc["latch_ms"] / 1000):
+            return
+        self.latch = hits
+        xs = np.array([[h[1], h[2]] for _, _, h in hits])
+        x, y, m = clamp_desktop(self.mons, *np.median(xs, axis=0))
+        self.anchor = self.pos = (x, y)
+        self.head0 = self.angles
+        self.state = "held"
+        self._move(x, y)
+        self._event({"type": "jump", "t": t, "anchor": [x, y], "n": len(hits)})
+        print(f"jump to ({x:.0f}, {y:.0f}) on {m.name}, median of {len(hits)} gaze frames")
+
+    def _follow_head(self):
+        """Held: cursor = anchor + gain * head delta (or relative steps while the
+        cursor position is unknown). Lock held."""
+        if self.state != "held" or self.angles is None:
+            return
+        rc = self.cfg["run"]
+        g = rc["gain_slow_px_per_deg"] if self.slow else rc["gain_px_per_deg"]
+        yaw, pitch = self.angles
+        if self.head0 is None:
+            self.head0 = self.rel_prev = self.angles
+        if self.anchor is None:
+            self.pointer.move_rel(g * (yaw - self.rel_prev[0]), -g * (pitch - self.rel_prev[1]))
+            self.rel_prev = self.angles
+            return
+        x = self.anchor[0] + g * (yaw - self.head0[0])
+        y = self.anchor[1] - g * (pitch - self.head0[1])
+        self.pos = clamp_desktop(self.mons, x, y)[:2]
+        self._move(*self.pos)
 
     def _record_frame(self, frame, t, seq, obs, hit):
         """Log this frame to events.jsonl, saving its image during holds and
@@ -281,16 +400,24 @@ class Live:
             "type": "frame", "t": t, "seq": seq, "state": self.state,
             "obs": obs.to_json() if obs else None,
             "gaze": [hit[1], hit[2]] if hit else None,
-            "cursor": list(self.pos) if self.state == "held" else None,
+            "cursor": list(self.pos) if self.state == "held" and self.anchor is not None else None,
         })
 
     def run(self):
         self._writer()
         self.listener.start()
+        if self.worker:
+            self.worker.start()
         kbds = ", ".join(d.name for d in self.listener.kbds)
         rc = self.cfg["run"]
-        reaim = f", {rc['reaim_key']} to re-aim" if rc["reaim_key"] else ""
-        print(f"ready: hold {rc['hotkey']} to point{reaim}; listening on {kbds} (Ctrl-C to quit)")
+        if rc["aim_mode"] == "anchor":
+            if not rc["reaim_key"]:
+                print("WARNING: aim_mode = anchor but no reaim_key set: nothing will jump to the gaze")
+            what = f"hold {rc['hotkey']} to move the cursor with your head, {rc['reaim_key']} to jump to the gaze"
+        else:
+            reaim = f", {rc['reaim_key']} to re-aim" if rc["reaim_key"] else ""
+            what = f"hold {rc['hotkey']} to point{reaim}"
+        print(f"ready: {what}; listening on {kbds} (Ctrl-C to quit)")
         seq = 0
         n, t_rate = 0, time.monotonic()
         try:
@@ -309,6 +436,9 @@ class Live:
             pass
         finally:
             self.listener.stop()
+            if self.worker:
+                self.worker.stop()
+                self.worker.join()
             self.cam.close()
             self.tracker.close()
             self.pointer.close()

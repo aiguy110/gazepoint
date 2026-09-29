@@ -35,9 +35,14 @@ DEFAULTS: dict = {
     },
     "gaze": {
         # ethxgaze_resnet18 (ETH-XGaze, normalised faces; far more robust to
-        # lighting) or a Gaze360 net: mobileone_s0 | mobilenetv2 | resnet18 |
-        # resnet34 | resnet50. The per-user correction is fit per model.
+        # lighting), unigaze_b16_joint (about twice as accurate again, ~8x the
+        # compute: ~60 ms/frame on 8 cores; use with run.gaze_thread), or a
+        # Gaze360 net: mobileone_s0 | mobilenetv2 | resnet18 | resnet34 |
+        # resnet50. The per-user correction is fit per model.
         "model": "ethxgaze_resnet18",
+        # onnxruntime intra-op threads for the gaze net; 0 = its default (all
+        # physical cores). `gazepoint bench` times a few settings.
+        "threads": 0,
         # Gaze360 nets only: side of the square face crop fed to the net,
         # relative to the landmark bounding box (they expect RetinaFace-ish boxes).
         "crop_scale": 1.0,
@@ -81,10 +86,22 @@ DEFAULTS: dict = {
     },
     "run": {
         "hotkey": "KEY_RIGHTCTRL",
-        # While the hotkey is held, pressing this jumps to the gaze again (e.g. to
-        # carry a drag to its destination). "" disables it.
+        # What pressing the hotkey does:
+        #   jump:   jump to the gaze (median over the next latch_ms), then head
+        #           motion refines.
+        #   anchor: head motion moves the cursor from where it is, with no jump;
+        #           reaim_key jumps to the gaze. The gaze net only runs while
+        #           the hotkey is held.
+        "aim_mode": "jump",
+        # While the hotkey is held, pressing this jumps to the gaze (again): the
+        # median over the latch_ms *before* the press, so the jump is immediate
+        # (e.g. to carry a drag to its destination). "" disables it.
         "reaim_key": "",
         "latch_ms": 120,
+        # Run the gaze net on its own thread, on the newest frame, so a slow
+        # net (UniGaze) doesn't hold back head tracking. Gaze then updates at
+        # the net's own rate.
+        "gaze_thread": True,
         # Cursor px per degree of head rotation while the key is held.
         "gain_px_per_deg": 35.0,
         # Lower gain for fine positioning while this key is held ("" disables).

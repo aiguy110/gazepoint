@@ -186,12 +186,44 @@ def cmd_download(cfg, args):
     models.download(args.gaze or None)
 
 
+def cmd_bench(cfg, args):
+    """Gaze-net latency per model and thread count (a random input; no camera needed)."""
+    import os
+    import time
+
+    import numpy as np
+
+    from .gaze import GazeNet, NormalizedGazeNet
+
+    names = args.models or [cfg["gaze"]["model"]]
+    threads = [int(n) for n in args.threads.split(",")]
+    print(f"{os.cpu_count()} logical CPUs; threads 0 = onnxruntime default")
+    for name in names:
+        if name not in models.GAZE_MODELS:
+            sys.exit(f"unknown gaze model {name!r}; choose from {models.GAZE_MODELS}")
+        models.fetch_gaze(name)
+        path = str(models.gaze_model_path(name))
+        for n in threads:
+            net = NormalizedGazeNet(path, n) if models.is_normalized(name) else GazeNet(path, threads=n)
+            face = np.random.randint(0, 255, (224, 224, 3), np.uint8)
+            for _ in range(3):
+                net(face)
+            k = 20
+            t = time.perf_counter()
+            for _ in range(k):
+                net(face)
+            print(f"  {name:20s} threads {n:2d}: {(time.perf_counter() - t) / k * 1000:6.1f} ms", flush=True)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="gazepoint", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("doctor", help="check environment, camera, monitors, permissions")
     d = sub.add_parser("download-models", help="fetch face landmarker + gaze net")
     d.add_argument("--gaze", nargs="*", help=f"gaze models to fetch ({', '.join(models.GAZE_MODELS)})")
+    b = sub.add_parser("bench", help="time the gaze net(s) at several thread counts")
+    b.add_argument("models", nargs="*", help="gaze models (default: the configured one)")
+    b.add_argument("--threads", default="1,2,4,8,12,0", help="comma-separated thread counts")
     sub.add_parser("monitors", help="print detected monitors and profile key")
     sub.add_parser("preview", help="webcam preview with gaze/head overlays")
     c = sub.add_parser("collect", help="show fixation targets, record labelled frames, calibrate, then show live gaze")
@@ -219,6 +251,7 @@ def main(argv=None):
     {
         "doctor": cmd_doctor,
         "download-models": cmd_download,
+        "bench": cmd_bench,
         "monitors": cmd_monitors,
         "preview": cmd_preview,
         "collect": cmd_collect,

@@ -25,7 +25,14 @@ different external monitors.
   `latch_ms`, warp there, and record the head pose. While the key is held,
   cursor = anchor + gain·Δhead. Gaze noise (≈2–4°) never touches the cursor
   after the jump. Head angles go through a One Euro filter. The cursor is not
-  smoothed with a PID loop; that only adds lag.
+  smoothed with a PID loop; that only adds lag. `run.aim_mode = "anchor"`
+  inverts the default: the hotkey only starts head-driven motion from the
+  current cursor, and `reaim_key` does the jump, using gaze from the
+  `latch_ms` *before* its press so it's instant. On Wayland the cursor can't
+  be read, so unless gazepoint put it where it is (and no other pointing
+  device moved it since), the head moves it through a second, relative uinput
+  device until the first jump. `run.gaze_thread` runs the gaze net on its own
+  thread on the newest frame, so a slow net doesn't hold back head tracking.
 - **Perception** (`tracker.py`): MediaPipe Face Landmarker gives landmarks,
   and `cv2.solvePnP` against MediaPipe's canonical face gives head pose and eye
   origin. The default gaze net is ETH-XGaze ResNet-18 (hysts/ptgaze). Its input
@@ -37,7 +44,11 @@ different external monitors.
   (yakhyo/gaze-estimation, square crop) report, so calibration code is shared.
   In a 2026-09 comparison on recorded sessions, the Gaze360 nets failed in
   backlit scenes. ETH-XGaze held up, and UniGaze-B was better still but ~8×
-  slower (the Phase 2 teacher). Observations hold only *uncalibrated* values
+  slower. UniGaze-B (`unigaze_b16_joint`, non-commercial weights) is exported
+  to ONNX on the dev box (`scripts/export_unigaze.py`) and
+  served from `https://outpost.kleinflask.us/gazepoint/` (nginx static;
+  `models.UNIGAZE_SHA256` pins it). `Tracker.head` / `Tracker.gaze` split
+  perception so the net can run on a worker thread. Observations hold only *uncalibrated* values
   plus `gaze_model`, so recorded data survives calibration changes and
   `reprocess` can swap models.
 - **Three calibration layers** (`calib.py`), persisted separately because they
@@ -128,9 +139,10 @@ in. Models live in `models/`. User config lives in
   over python-xlib's own connection instead.
 - Use `evdev-binary` (prebuilt wheels), not `evdev`. The target may not have
   a compiler.
-- Perception costs about 30 ms/frame on bifrost's CPU with ETH-XGaze
-  (landmarks ~12 ms, gaze net ~17 ms at 224²; the old Gaze360 MobileOne net
-  was ~10 ms at 448²). The laptop will be slower, so check `preview` fps.
+- Gaze-net cost on bifrost (Ryzen 7 3700X, onnxruntime): ETH-XGaze ~7–9 ms,
+  UniGaze-B ~60 ms at 8 threads (~90 at 4); landmarks ~12 ms. The laptop
+  (Core Ultra 7, 22 threads) is likely at least as fast; measure it there with
+  `gazepoint bench` and set `gaze.threads`.
 
 ## Not yet verified on real hardware (check these first)
 

@@ -2,6 +2,8 @@
 
 import json
 import threading
+import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,21 +13,26 @@ from gazepoint import calib, config
 from gazepoint.gaze import face_frame, vec_to_angles
 from gazepoint.io import OneEuro, PointerDecoder
 from gazepoint.monitors import Monitor
-from gazepoint.run import Live
-from gazepoint.tracker import Observation
+from gazepoint.run import GazeWorker, Live
+from gazepoint.tracker import Observation, Pending
 
 LAPTOP = Monitor("L", "laptop", "eDP-1", 0, 0, 1920, 1200, 300.0, 190.0, True)
 
 
 class FakePointer:
-    def __init__(self):
+    def __init__(self, pos=None):
         self.moves = []
+        self.rel = []
+        self.pos = pos  # None = unreadable, as on Wayland
 
     def move(self, x, y):
         self.moves.append((x, y))
 
+    def move_rel(self, dx, dy):
+        self.rel.append((dx, dy))
+
     def position(self):
-        return None
+        return self.pos
 
 
 class FakeTracker:
@@ -36,11 +43,18 @@ class FakeTracker:
         self.P = screen.point_cam(*uv)
         self.head_yaw = 0.0
 
-    def process(self, frame, t, seq, keep_landmarks=False):
+        self.gaze_calls = 0
+
+    def head(self, frame, t, seq, keep_landmarks=False):
+        obs = Observation(t, seq, np.eye(3).tolist(), self.o.tolist(), self.head_yaw, 0.0,
+                          self.o.tolist(), [0, 0, 1, 1], None, None)
+        return Pending(obs, None, None, self.o)
+
+    def gaze(self, p):
+        self.gaze_calls += 1
         fR = face_frame(self.o)
         yaw, pitch = np.degrees(vec_to_angles(fR.T @ (self.P - self.o)))
-        return Observation(t, seq, np.eye(3).tolist(), self.o.tolist(), self.head_yaw, 0.0,
-                           self.o.tolist(), [0, 0, 1, 1], [float(yaw), float(pitch)], fR.tolist())
+        return replace(p.obs, gaze_raw=[float(yaw), float(pitch)], frame_R=fR.tolist())
 
 
 @pytest.fixture
@@ -55,6 +69,7 @@ def live(tmp_path, monkeypatch):
     lv.screens = list(screens.values())
     lv.tracker = FakeTracker(screens["L"], (150.0, 95.0))  # panel centre
     lv.pointer = FakePointer()
+    lv.worker = None
     lv.f_yaw, lv.f_pitch = OneEuro(), OneEuro()
     lv.cam = SimpleNamespace(width=64, height=48, K=np.eye(3))
     lv.lock = threading.Lock()
@@ -83,7 +98,7 @@ def test_press_jump_refine_release(live):
 
 
 def test_no_face_explains_once(live, capsys):
-    live.tracker.process = lambda *a, **k: None
+    live.tracker.head = lambda *a, **k: None
     live.on_key(True, 0.0)
     for i in range(1, 20):
         live.step(None, i / 30, i)
@@ -103,13 +118,12 @@ def test_reaim_jumps_while_held(live):
     assert live.state == "held"
     x0, _ = live.pointer.moves[-1]
     live.tracker.P = live.screens[0].point_cam(250.0, 95.0)  # look further right
-    live.on_reaim(True, t)
-    assert live.state == "latching"
-    n = len(live.pointer.moves)
-    for i in range(8, 15):
+    for i in range(8, 15):  # > latch_ms of looking there before pressing
         t += 1 / 30
         live.step(None, t, i)
-    assert live.state == "held"
+    n = len(live.pointer.moves)
+    live.on_reaim(True, t)
+    assert live.state == "held"  # the gaze from before the press: jumps at once
     x1, y1 = live.pointer.moves[n]
     assert x1 > x0 + 500 and abs(y1 - 600) < 5  # jumped to the new gaze point
     live.on_reaim(False, t)
@@ -199,3 +213,78 @@ def test_pointer_decoder():
         {"type": "button", "t": 0.07, "dev": "m", "button": "right", "down": True},
         {"type": "wheel", "t": 0.08, "dev": "m", "dy": -1},
     ]
+
+
+def anchor_mode(live, pos=None):
+    live.cfg["run"]["aim_mode"] = "anchor"
+    live.pointer = FakePointer(pos)
+
+
+def test_anchor_mode_moves_from_cursor_without_jumping(live):
+    anchor_mode(live, pos=(100, 200))
+    t = 0.0
+    for i in range(1, 5):
+        t += 1 / 30
+        live.step(None, t, i)
+    assert live.tracker.gaze_calls == 0  # gaze net idle until the key is held
+    live.on_key(True, t)
+    assert live.state == "held" and live.pointer.moves == []
+    live.tracker.head_yaw = 5.0
+    for i in range(5, 40):
+        t += 1 / 30
+        live.step(None, t, i)
+    assert live.tracker.gaze_calls > 0
+    xs = [x for x, _ in live.pointer.moves]
+    assert all(abs(x - 100) < 3 * 5 * live.cfg["run"]["gain_px_per_deg"] for x in xs)  # no jump to the panel centre
+    assert xs[-1] > 100 + 100 and abs(live.pointer.moves[-1][1] - 200) < 5
+    n = len(live.pointer.moves)
+    live.on_reaim(True, t)  # jump to the gaze, from frames already seen
+    x, y = live.pointer.moves[n]
+    assert abs(x - 960) < 5 and abs(y - 600) < 5
+    live.on_key(False, t)
+    assert live.state == "idle"
+
+
+def test_anchor_mode_moves_relatively_when_position_unknown(live):
+    anchor_mode(live)
+    t = 0.0
+    live.step(None, t, 1)
+    live.on_key(True, t)
+    live.tracker.head_yaw = 5.0
+    for i in range(2, 40):
+        t += 1 / 30
+        live.step(None, t, i)
+    assert live.pointer.moves == []
+    dx = sum(d for d, _ in live.pointer.rel)
+    assert dx > 0.8 * 5 * live.cfg["run"]["gain_px_per_deg"]
+    live.on_reaim(True, t)
+    assert live.pointer.moves and live.anchor is not None  # absolute again after the jump
+    live.on_key(False, t)
+    # Nothing else moved the pointer since: the next hold starts from the known position.
+    live.on_key(True, t)
+    assert live.anchor == live.pos and live.anchor is not None
+    live.on_key(False, t)
+    live.on_pointer({"type": "motion", "t": t, "dev": "touchpad", "dx": 3, "dy": 0})
+    live.on_key(True, t)
+    assert live.anchor is None  # moved by the touchpad: unknown again
+    live.on_key(False, t)
+
+
+def test_gaze_worker_thread(live):
+    live.worker = GazeWorker(live.tracker, live.on_gaze)
+    live.worker.start()
+    try:
+        t = 0.0
+        live.on_key(True, t)
+        for i in range(1, 30):
+            t += 1 / 30
+            live.step(None, t, i)
+            time.sleep(0.005)
+            if live.state == "held":
+                break
+        assert live.state == "held"
+        x, y = live.pointer.moves[0]
+        assert abs(x - 960) < 5 and abs(y - 600) < 5
+    finally:
+        live.worker.stop()
+        live.worker.join()

@@ -1,5 +1,7 @@
 """Per-frame perception: MediaPipe landmarks -> head pose (PnP) -> face image -> gaze net.
 
+`head` and `gaze` split the two halves so the gaze net can run on its own thread.
+
 Produces an Observation holding only *uncalibrated* quantities; the per-user
 correction and screen geometry are applied downstream (calib.py), so recorded
 observations stay valid when calibration changes.
@@ -7,7 +9,7 @@ observations stay valid when calibration changes.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 import cv2
 import mediapipe as mp
@@ -15,7 +17,7 @@ import numpy as np
 from mediapipe.tasks.python import BaseOptions, vision
 
 from . import models
-from .gaze import EthXGazeNet, GazeNet, face_frame, normalize_face, vec_to_angles
+from .gaze import GazeNet, NormalizedGazeNet, face_frame, normalize_face, vec_to_angles
 
 # Canonical-model vertices used to place the eyes (outer/inner corners, lids).
 _RIGHT_EYE = [33, 133, 159, 145]
@@ -56,13 +58,23 @@ class Observation:
     head_pitch: float
     eye_origin: list  # mm, camera frame (midpoint of the eyes)
     bbox: list  # face crop x0, y0, x1, y1 (px)
-    gaze_raw: list  # [yaw, pitch] degrees, model output in the model's frame
-    frame_R: list  # 3x3, model frame -> camera (identity if face_centered is off)
+    gaze_raw: list | None  # [yaw, pitch] degrees, model output in the model's frame
+    frame_R: list | None  # 3x3, model frame -> camera (identity if face_centered is off)
     landmarks: list | None = None  # 478x2 px, only kept when recording
     gaze_model: str | None = None  # None in sessions recorded before this was stored
 
     def to_json(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class Pending:
+    """A head-only Observation plus what the gaze net needs (Tracker.head -> Tracker.gaze)."""
+
+    obs: Observation
+    face: np.ndarray  # normalised face, or square crop for the Gaze360 nets
+    Rn: np.ndarray | None  # camera -> normalised camera (normalised models only)
+    eye_origin: np.ndarray
 
 
 class Tracker:
@@ -83,9 +95,10 @@ class Tracker:
             self.canonical[_RIGHT_EYE].mean(axis=0) + self.canonical[_LEFT_EYE].mean(axis=0)
         ) / 2
         self.model = cfg["gaze"]["model"]
-        self.eth = models.is_eth(self.model)
+        self.normalized = models.is_normalized(self.model)
         path = str(models.gaze_model_path(self.model))
-        self.net = EthXGazeNet(path) if self.eth else GazeNet(path)
+        threads = cfg["gaze"]["threads"]
+        self.net = NormalizedGazeNet(path, threads) if self.normalized else GazeNet(path, threads=threads)
         c = self.canonical
         self.face_center = (c[_EYE_CORNERS].mean(axis=0) + c[_NOSTRILS].mean(axis=0)) / 2
         self._rvec = None
@@ -138,6 +151,12 @@ class Tracker:
         return frame[by0:by1, bx0:bx1], [bx0, by0, bx1, by1]
 
     def process(self, frame: np.ndarray, t: float, seq: int, keep_landmarks: bool = False):
+        p = self.head(frame, t, seq, keep_landmarks)
+        return self.gaze(p) if p is not None else None
+
+    def head(self, frame: np.ndarray, t: float, seq: int, keep_landmarks: bool = False) -> Pending | None:
+        """Landmarks and head pose (~12 ms), plus the gaze net's input. The
+        Observation's gaze fields stay None until `gaze` fills them in."""
         lm = self._landmarks(frame, t)
         if lm is None:
             return None
@@ -146,23 +165,18 @@ class Tracker:
             return None
         R, tv = pose
         eye_origin = R @ self.eye_mid + tv
-        if self.eth:
-            # Gaze in the normalised camera -> camera -> the same face-centred
-            # angles the Gaze360 path reports, so calibration code is shared.
+        if self.normalized:
             face, Rn = normalize_face(frame, self.K, R[:, 0], R @ self.face_center + tv)
-            fR = face_frame(eye_origin)
-            yaw, pitch = vec_to_angles(fR.T @ (Rn.T @ self.net(face)))
             x0, y0 = lm.min(axis=0)
             x1, y1 = lm.max(axis=0)
             bbox = [int(x0), int(y0), int(x1), int(y1)]
         else:
-            crop, bbox = self.crop(frame, lm)
-            if crop.size == 0:
+            face, bbox = self.crop(frame, lm)
+            Rn = None
+            if face.size == 0:
                 return None
-            yaw, pitch = self.net(crop)
-            fR = face_frame(eye_origin) if self.cfg["gaze"]["face_centered"] else np.eye(3)
         hy, hp = head_angles(R)
-        return Observation(
+        obs = Observation(
             t=t,
             seq=seq,
             head_R=R.round(6).tolist(),
@@ -171,8 +185,27 @@ class Tracker:
             head_pitch=round(hp, 4),
             eye_origin=eye_origin.round(3).tolist(),
             bbox=bbox,
+            gaze_raw=None,
+            frame_R=None,
+            landmarks=lm.round(2).tolist() if keep_landmarks else None,
+            gaze_model=None,
+        )
+        return Pending(obs, face, Rn, eye_origin)
+
+    def gaze(self, p: Pending) -> Observation:
+        """Run the gaze net on a `head` result. Thread-safe against `head`, so
+        it can run on a worker thread."""
+        if self.normalized:
+            # Gaze in the normalised camera -> camera -> the same face-centred
+            # angles the Gaze360 path reports, so calibration code is shared.
+            fR = face_frame(p.eye_origin)
+            yaw, pitch = vec_to_angles(fR.T @ (p.Rn.T @ self.net(p.face)))
+        else:
+            yaw, pitch = self.net(p.face)
+            fR = face_frame(p.eye_origin) if self.cfg["gaze"]["face_centered"] else np.eye(3)
+        return replace(
+            p.obs,
             gaze_raw=[round(float(np.degrees(yaw)), 4), round(float(np.degrees(pitch)), 4)],
             frame_R=fR.round(6).tolist(),
-            landmarks=lm.round(2).tolist() if keep_landmarks else None,
             gaze_model=self.model,
         )

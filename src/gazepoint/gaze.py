@@ -45,13 +45,20 @@ def face_frame(center: np.ndarray) -> np.ndarray:
     return np.stack([x, y, z], axis=1)
 
 
+def inference_session(path: str, threads: int = 0) -> ort.InferenceSession:
+    """threads: intra-op threads for the CPU provider; 0 = onnxruntime's default (all physical cores)."""
+    avail = ort.get_available_providers()
+    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = threads
+    return ort.InferenceSession(path, opts, providers=providers)
+
+
 class GazeNet:
     """L2CS-style binned-regression net: face crop -> (yaw, pitch) radians."""
 
-    def __init__(self, path: str, bins: int = 90, binwidth: float = 4.0, offset: float = 180.0):
-        avail = ort.get_available_providers()
-        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
-        self.session = ort.InferenceSession(path, providers=providers)
+    def __init__(self, path: str, bins: int = 90, binwidth: float = 4.0, offset: float = 180.0, threads: int = 0):
+        self.session = inference_session(path, threads)
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
         h, w = inp.shape[2], inp.shape[3]
@@ -90,14 +97,12 @@ def normalize_face(frame, K, head_x, center, focal=960.0, distance=600.0, size=2
     return cv2.warpPerspective(frame, W, (size, size)), R
 
 
-class EthXGazeNet:
-    """Regression net trained on normalised ETH-XGaze faces (hysts/ptgaze ResNet-18):
+class NormalizedGazeNet:
+    """Regression net on ETH-XGaze-normalised faces (hysts/ptgaze ResNet-18, UniGaze):
     normalised 224x224 face -> gaze direction in the normalised camera frame."""
 
-    def __init__(self, path: str):
-        avail = ort.get_available_providers()
-        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
-        self.session = ort.InferenceSession(path, providers=providers)
+    def __init__(self, path: str, threads: int = 0):
+        self.session = inference_session(path, threads)
         self.input_name = self.session.get_inputs()[0].name
         self.providers = self.session.get_providers()
 
