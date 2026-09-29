@@ -91,6 +91,14 @@ DEFAULTS: dict = {
         "one_euro_min_cutoff": 1.0,
         "one_euro_beta": 0.05,
         "log_usage": True,
+        # With log_usage: events.jsonl gets every frame's observation plus key,
+        # mouse button, wheel, touch, and motion events, so labels can be
+        # rederived offline (e.g. drop abandoned holds, label by click position).
+        # Webcam frames are saved for the whole of each hold and for this long
+        # around every key/button event (~100 KB each at 720p).
+        "context_before_s": 0.5,
+        "context_after_s": 0.3,
+        "save_hold_frames": True,
         # X11 only: log (frame ~150ms before click, cursor position) pairs.
         "log_clicks": False,
         "click_lookback_ms": 150,

@@ -95,7 +95,14 @@ Collect presentations that weren't a steady fixation are listed in
 `session.json`'s `rejected_targets`. Their frames are kept, but `calibrate` and
 `eval` skip them (`record.labelled`).
 `usage` sessions come from `run`. When the key is released, the latch frames
-are labelled with the final cursor position. Clicks logged with `--log-clicks`
+are labelled with the final cursor position. That label is wrong for abandoned
+or retried holds, so usage sessions also keep `events.jsonl`: every frame's
+observation and gaze hit, aim/re-aim key and mouse button/wheel/touch/motion
+events from all pointing devices (never other keys), and the cursor gazepoint
+set. Webcam frames are saved for whole holds and ±`context_*_s` around events.
+Derive better labels offline from it (format in `run.py`'s docstring). On
+Wayland the cursor position is only known while gazepoint drives it;
+`cursor_trusted` goes false once another device moves it. Clicks logged with `--log-clicks`
 (X11 only) are stored with `obs: null` until `gazepoint reprocess` fills them
 in. Models live in `models/`. User config lives in
 `~/.config/gazepoint/config.toml` (overrides `config.DEFAULTS`).

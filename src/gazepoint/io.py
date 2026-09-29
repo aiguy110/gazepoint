@@ -139,16 +139,62 @@ def readable_input() -> bool:
     return any(os.access(f"/dev/input/{n}", os.R_OK) for n in os.listdir("/dev/input") if n.startswith("event"))
 
 
+class PointerDecoder:
+    """Turns raw evdev events from pointing devices into log records: button
+    down/up, wheel steps, touch begin/end (touchpads), and relative motion
+    coalesced to at most one record per `motion_s` per device. Touchpad
+    tap-to-click is synthesised by libinput, so it never shows up here."""
+
+    BUTTONS = {0x110: "left", 0x111: "right", 0x112: "middle", 0x113: "side", 0x114: "extra"}
+
+    def __init__(self, emit: Callable[[dict], None], motion_s: float = 0.05):
+        from evdev import ecodes as e
+
+        self.e = e
+        self.emit = emit
+        self.motion_s = motion_s
+        self._motion: dict[str, list] = {}  # dev -> [dx, dy, t_first]
+
+    def feed(self, dev: str, type_: int, code: int, value: int, t: float):
+        e = self.e
+        if type_ == e.EV_KEY and value in (0, 1):
+            if code in self.BUTTONS:
+                self.flush(dev)
+                self.emit({"type": "button", "t": t, "dev": dev, "button": self.BUTTONS[code], "down": value == 1})
+            elif code == e.BTN_TOUCH:
+                self.emit({"type": "touch", "t": t, "dev": dev, "down": value == 1})
+        elif type_ == e.EV_REL:
+            if code in (e.REL_X, e.REL_Y):
+                m = self._motion.setdefault(dev, [0, 0, t])
+                m[0 if code == e.REL_X else 1] += value
+            elif code in (e.REL_WHEEL, e.REL_HWHEEL):
+                self.emit({"type": "wheel", "t": t, "dev": dev,
+                           "dx" if code == e.REL_HWHEEL else "dy": value})
+        elif type_ == e.EV_SYN:
+            m = self._motion.get(dev)
+            if m and t - m[2] >= self.motion_s:
+                self.flush(dev, t)
+
+    def flush(self, dev: str | None = None, t: float | None = None):
+        """Emit pending motion for dev (or every device)."""
+        for d in [dev] if dev else list(self._motion):
+            m = self._motion.pop(d, None)
+            if m and (m[0] or m[1]):
+                self.emit({"type": "motion", "t": t if t is not None else m[2], "dev": d, "dx": m[0], "dy": m[1]})
+
+
 class InputListener(threading.Thread):
     """Calls on_key(down: bool, t) for the hotkey, on_reaim(down, t) for the
-    re-aim key (if any), and on_click(t) for left clicks.
+    re-aim key (if any), on_click(t) for left clicks, and on_pointer(record)
+    for PointerDecoder records from every pointing device.
 
     Does not grab devices: the keys still reach applications, so pick ones
     whose lone press/release is harmless (Right Ctrl by default).
     """
 
     def __init__(self, key_name: str, on_key: Callable, on_click: Callable | None = None,
-                 reaim_name: str = "", on_reaim: Callable | None = None):
+                 reaim_name: str = "", on_reaim: Callable | None = None,
+                 on_pointer: Callable[[dict], None] | None = None):
         super().__init__(daemon=True, name="input")
         from evdev import ecodes as e
 
@@ -163,6 +209,8 @@ class InputListener(threading.Thread):
         self.sibling = (other, e.ecodes[other]) if other != key_name and other in e.ecodes else None
         self._hinted = False
         self.on_click = on_click
+        self.pointer = PointerDecoder(on_pointer) if on_pointer else None
+        self.read_mice = bool(on_click or on_pointer)
         self.kbds, self.mice = input_devices(set(self.handlers))
         if not self.kbds:
             raise RuntimeError(
@@ -176,7 +224,7 @@ class InputListener(threading.Thread):
         known = {d.path for d in devs.values()}
         kbds, mice = input_devices(set(self.handlers))
         for d in kbds + mice:
-            if d.path in known or (d in mice and not self.on_click):
+            if d.path in known or (d in mice and not self.read_mice):
                 d.close()
                 continue
             devs[d.fd] = d
@@ -184,13 +232,15 @@ class InputListener(threading.Thread):
 
     def run(self):
         e = self.e
-        devs = {d.fd: d for d in self.kbds + (self.mice if self.on_click else [])}
+        devs = {d.fd: d for d in self.kbds + (self.mice if self.read_mice else [])}
         last_scan = time.monotonic()
         while not self._stop:
             if time.monotonic() - last_scan > 2:
                 self._rescan(devs)
                 last_scan = time.monotonic()
             r, _, _ = select.select(list(devs), [], [], 0.2)
+            if self.pointer and not r:
+                self.pointer.flush()
             for fd in r:
                 try:
                     events = list(devs[fd].read())
@@ -199,9 +249,11 @@ class InputListener(threading.Thread):
                     devs.pop(fd).close()
                     continue
                 for ev in events:
+                    t = time.monotonic()
+                    if self.pointer:
+                        self.pointer.feed(devs[fd].name, ev.type, ev.code, ev.value, t)
                     if ev.type != e.EV_KEY:
                         continue
-                    t = time.monotonic()
                     handler = self.handlers.get(ev.code)
                     if handler and ev.value in (0, 1):
                         handler(ev.value == 1, t)
