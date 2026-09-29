@@ -70,6 +70,7 @@ class Tracker:
         self.cfg = cfg
         self.K = K
         self.video = video
+        models.ensure(cfg)
         mode = vision.RunningMode.VIDEO if video else vision.RunningMode.IMAGE
         opts = vision.FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(models.face_landmarker_path())),

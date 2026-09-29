@@ -78,6 +78,13 @@ def download(gaze_models: list[str] | None = None) -> None:
             _fetch(GAZE_URL.format(name=n), gaze_model_path(n))
 
 
+def ensure(cfg: dict) -> None:
+    """Download whatever `cfg` needs that's missing (e.g. after a `git pull` without bootstrap)."""
+    if check(cfg):
+        print("missing models; downloading", file=sys.stderr)
+        download([cfg["gaze"]["model"]])
+
+
 def check(cfg: dict) -> list[str]:
     """Return a list of missing asset paths."""
     need = [face_landmarker_path(), canonical_face_path(), gaze_model_path(cfg["gaze"]["model"])]
