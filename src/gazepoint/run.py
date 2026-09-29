@@ -12,6 +12,8 @@ State machine (driven by camera frames and gaze results):
   held --reaim key still down after track_after_ms--> tracking: the cursor
       follows the smoothed gaze (GazeSmoother)
   tracking --reaim key up--> held, anchored where tracking left the cursor
+  held --scroll key down--> cursor frozen; head displacement controls scroll
+  scrolling --scroll key up--> held, head motion re-anchored without a jump
 
 In anchor mode on Wayland the cursor position can't be read, so unless
 gazepoint put it where it is, head motion moves it by relative steps until the
@@ -27,7 +29,7 @@ raw stream in events.jsonl, from which labels can be rederived offline:
   frame    t, seq, state, obs, gaze [x, y] (current calibration), cursor
            (obs has gaze_raw None when the net didn't run on this frame here)
   gaze     t, seq, obs, gaze   (gaze_thread only: net results, t = capture time)
-  key      t, key (aim|reaim|slow), down, state
+  key      t, key (aim|reaim|slow|scroll), down, state
   anchor   t, cursor (None if unknown: moving relatively)   (anchor mode)
   jump     t, anchor, n (gaze frames in the median)
   track    t, down (tracking started/stopped), cursor
@@ -114,6 +116,35 @@ class GazeSmoother:
         return self.pos
 
 
+class HeadScroller:
+    """Integrate head displacement from a neutral pose into wheel detents."""
+
+    def __init__(self, rc: dict, angles: tuple[float, float], t: float):
+        self.rc, self.neutral, self.t = rc, angles, t
+        self.velocity = np.zeros(2, dtype=float)  # horizontal, vertical detents/s
+
+    def _speed(self, delta: float, gain: float) -> float:
+        d = max(abs(delta) - self.rc["scroll_deadzone_deg"], 0.0)
+        speed = gain * d ** self.rc["scroll_curve"]
+        return np.sign(delta) * min(speed, self.rc["scroll_max_steps_per_s"])
+
+    def __call__(self, angles: tuple[float, float], t: float, slow: bool = False):
+        dt = min(max(t - self.t, 0.0), 0.1)
+        yaw, pitch = angles
+        target = np.array([
+            self._speed(yaw - self.neutral[0], self.rc["scroll_horizontal_steps_per_s_per_deg"])
+            if self.rc["scroll_horizontal"] else 0.0,
+            self._speed(self.neutral[1] - pitch, self.rc["scroll_vertical_steps_per_s_per_deg"]),
+        ])
+        if slow:
+            target *= self.rc["scroll_slow_factor"]
+        tau = self.rc["scroll_tau_ms"] / 1000
+        a = 1 - np.exp(-dt / tau) if tau > 0 else 1.0
+        self.velocity += a * (target - self.velocity)
+        self.t = t
+        return tuple(self.velocity * dt)
+
+
 class GazeWorker(threading.Thread):
     """Runs the gaze net on the newest submitted frame; older ones are dropped."""
 
@@ -170,7 +201,8 @@ class Live:
                                       rc["reaim_key"], self.on_reaim,
                                       # Anchor mode needs to know when another device moves the pointer.
                                       self.on_pointer if rc["log_usage"] or rc["aim_mode"] == "anchor" else None,
-                                      rc["slow_key"], self.on_slow)
+                                      rc["slow_key"], self.on_slow,
+                                      rc["scroll_key"], self.on_scroll)
 
     def _init_state(self):
         rc = self.cfg["run"]
@@ -186,6 +218,7 @@ class Live:
         self.head0 = None
         self.angles = None  # latest filtered (yaw, pitch)
         self.slow = False  # slow-gain key held
+        self.scroller = None  # HeadScroller while the scroll key is held
         self.reaim_t = None  # when the re-aim key went down, while it's held
         self.smoother = None  # GazeSmoother while tracking
         self.pos = None
@@ -307,6 +340,20 @@ class Live:
             if self.state == "held" and self.angles and self.anchor is not None:
                 self.anchor, self.head0 = self.pos, self.angles
 
+    def on_scroll(self, down: bool, t: float):
+        """Hold to freeze the cursor and control scroll velocity with head pose."""
+        with self.lock:
+            self._event({"type": "key", "t": t, "key": "scroll", "down": down, "state": self.state})
+            if down and self.state == "held" and self.angles is not None and self.scroller is None:
+                self.scroller = HeadScroller(self.cfg["run"], self.angles, t)
+                print("head scroll on")
+            elif not down and self.scroller is not None:
+                self.scroller = None
+                self.head0 = self.rel_prev = self.angles
+                if self.anchor is not None:
+                    self.anchor = self.pos
+                print("head scroll off")
+
     def on_pointer(self, rec: dict):
         """Raw pointing-device event from the input thread (io.PointerDecoder)."""
         with self.lock:
@@ -339,7 +386,7 @@ class Live:
             print("hotkey up")
         else:
             print("hotkey up before a gaze fix; cursor not moved")
-        self.state, self.smoother = "idle", None
+        self.state, self.smoother, self.scroller = "idle", None, None
         self.latch = []
 
     def _log_segment(self):
@@ -381,7 +428,10 @@ class Live:
             if obs.gaze_raw is not None:
                 self._add_gaze(frame, obs, hit)
             self._maybe_track(t)
-            self._follow_head()
+            if self.scroller is not None:
+                self.pointer.scroll(*self.scroller(self.angles, t, self.slow))
+            else:
+                self._follow_head()
             self._record_frame(frame, t, seq, obs, hit)
         if want and self.worker:
             self.worker.submit(frame, p)
@@ -406,7 +456,7 @@ class Live:
                 self._latch_stalled(obs.t, "gaze misses every screen")
             self._try_jump(obs.t)
         self._maybe_track(obs.t)
-        if self.state == "tracking" and hit:
+        if self.state == "tracking" and self.scroller is None and hit:
             x, y = self.smoother(hit[1], hit[2], obs.t)
             self.pos = clamp_desktop(self.mons, x, y)[:2]
             self._move(*self.pos)
@@ -480,7 +530,7 @@ class Live:
             if not rc["reaim_key"]:
                 print("WARNING: aim_mode = anchor but no reaim_key set: nothing will jump to the gaze")
             what = (f"hold {rc['hotkey']} to move the cursor with your head, tap {rc['reaim_key']} to jump to"
-                    f" the gaze, hold it to follow the gaze")
+                    f" the gaze, hold it to follow the gaze, hold {rc['scroll_key']} to scroll with your head")
         else:
             reaim = f", tap {rc['reaim_key']} to re-aim, hold it to follow the gaze" if rc["reaim_key"] else ""
             what = f"hold {rc['hotkey']} to point{reaim}"

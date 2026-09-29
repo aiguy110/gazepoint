@@ -13,7 +13,7 @@ from gazepoint import calib, config
 from gazepoint.gaze import face_frame, vec_to_angles
 from gazepoint.io import OneEuro, PointerDecoder
 from gazepoint.monitors import Monitor
-from gazepoint.run import GazeSmoother, GazeWorker, Live
+from gazepoint.run import GazeSmoother, GazeWorker, HeadScroller, Live
 from gazepoint.tracker import Observation, Pending
 
 LAPTOP = Monitor("L", "laptop", "eDP-1", 0, 0, 1920, 1200, 300.0, 190.0, True)
@@ -23,6 +23,7 @@ class FakePointer:
     def __init__(self, pos=None):
         self.moves = []
         self.rel = []
+        self.scrolls = []
         self.pos = pos  # None = unreadable, as on Wayland
 
     def move(self, x, y):
@@ -33,6 +34,9 @@ class FakePointer:
 
     def position(self):
         return self.pos
+
+    def scroll(self, dx, dy):
+        self.scrolls.append((dx, dy))
 
 
 class FakeTracker:
@@ -153,6 +157,46 @@ def test_slow_key_lowers_gain_without_jumping(live):
     live.on_slow(False, t)
     assert 0 < x1 - x0 < 0.6 * 5 * live.cfg["run"]["gain_px_per_deg"]  # 5 deg at the low gain
     live.on_key(False, t)
+
+
+def test_head_scroll_freezes_cursor_and_reanchors(live):
+    anchor_mode(live, pos=(100, 200))
+    t = 0.0
+    live.step(None, t, 1)
+    live.on_key(True, t)
+    live.on_scroll(True, t)
+    n = len(live.pointer.moves)
+    live.tracker.head_yaw = 3.0
+    # A lower pitch means nodding down, which scrolls down.
+    live.tracker.head = lambda frame, tm, seq, keep_landmarks=False: Pending(
+        Observation(tm, seq, np.eye(3).tolist(), live.tracker.o.tolist(), 3.0, -3.0,
+                    live.tracker.o.tolist(), [0, 0, 1, 1], None, None),
+        None, None, live.tracker.o)
+    for i in range(2, 35):
+        t += 1 / 30
+        live.step(None, t, i)
+    assert len(live.pointer.moves) == n  # cursor was frozen
+    assert sum(dx for dx, _ in live.pointer.scrolls) > 0
+    assert sum(dy for _, dy in live.pointer.scrolls) > 0
+    live.on_scroll(False, t)
+    before = len(live.pointer.moves)
+    live.step(None, t + 1 / 30, 35)
+    assert len(live.pointer.moves) == before + 1
+    assert np.allclose(live.pointer.moves[-1], (100, 200), atol=1)  # no release jump
+    live.on_key(False, t)
+
+
+def test_head_scroller_deadzone_curve_and_slow_gain():
+    rc = config.DEFAULTS["run"]
+    normal = HeadScroller(rc, (0.0, 0.0), 0.0)
+    assert normal((0.5, -0.5), 0.1) == (0.0, 0.0)  # inside dead zone
+    for i in range(1, 20):
+        out = normal((2.0, -2.0), 0.1 + i / 30)
+    assert out[0] > 0 and out[1] > 0
+    slow = HeadScroller(rc, (0.0, 0.0), 0.0)
+    for i in range(1, 20):
+        slow_out = slow((2.0, -2.0), i / 30, slow=True)
+    assert slow_out[0] < out[0] * 0.3
 
 
 def test_reaim_ignored_when_idle(live):

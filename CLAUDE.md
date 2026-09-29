@@ -31,7 +31,10 @@ different external monitors.
   `latch_ms` *before* its press so it's instant. Holding `reaim_key` past
   `track_after_ms` makes the cursor follow the gaze, smoothed per
   `run.track_filter` (One Euro by default), until it's released; head
-  refinement then continues from there. On Wayland the cursor can't
+  refinement then continues from there. Holding `scroll_key` freezes the
+  cursor and maps displacement from the current head pose to smoothed,
+  nonlinear vertical/horizontal scroll velocity; releasing it re-anchors
+  head pointing without a cursor jump. On Wayland the cursor can't
   be read, so unless gazepoint put it where it is (and no other pointing
   device moved it since), the head moves it through a second, relative uinput
   device until the first jump. `run.gaze_thread` runs the gaze net on its own
@@ -183,8 +186,9 @@ laptop's settings and the example to copy; document new settings there).
   right pinky with a 200 ms tapping term, so expect that much lag before the
   hotkey registers.
   The user's Chocofi (`aiguy110/miryoku_zmk`) instead sends F14 while its MOUSE
-  layer is held (no home-row-mod lag) and, on that layer, F15 as `reaim_key` on the left index home key and F16
-  (left index-inner home key) as `slow_key`; its MOUSE thumbs
+  layer is held (no home-row-mod lag) and, on that layer, F15 as `reaim_key`
+  on the left index home key, F16 (left index-inner home key) as `slow_key`,
+  and F17 (right pinky) as `scroll_key`; its MOUSE thumbs
   click left (RET), right (BSPC), middle (DEL).
   `scripts/setup-input-perms.sh` is needed for `/dev/input` and `/dev/uinput`.
 

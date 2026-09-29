@@ -114,6 +114,28 @@ gain_px_per_deg = 30.0
 slow_key = "KEY_F16"
 gain_slow_px_per_deg = 5.0
 
+# Hold this while the aim hotkey is down to freeze the cursor and scroll with
+# the head. Pitch scrolls vertically; yaw scrolls horizontally. Existing
+# keyboard/mouse wheel bindings continue to work normally. "" disables.
+scroll_key = "KEY_F17"
+# Head motion inside this radius is ignored, so holding still stops scrolling.
+scroll_deadzone_deg = 0.6
+# Wheel detents per second per degree beyond the dead zone. High-resolution
+# wheel events make fractions of a detent useful in applications that support
+# smooth scrolling; X11 core-wheel fallback accumulates them into whole steps.
+scroll_vertical_steps_per_s_per_deg = 3.0
+scroll_horizontal_steps_per_s_per_deg = 2.0
+# Exponent on displacement beyond the dead zone. Values above 1 give precise
+# control near neutral while allowing large motions to accelerate.
+scroll_curve = 1.5
+scroll_max_steps_per_s = 24.0
+# Exponential smoothing time constant for scroll velocity (0 disables).
+scroll_tau_ms = 100
+# Multiplier applied while slow_key is held.
+scroll_slow_factor = 0.2
+# false disables yaw-to-horizontal scrolling while retaining vertical scroll.
+scroll_horizontal = true
+
 # Continuous gaze tracking (reaim_key held):
 # How long reaim_key must be held before the cursor starts following the gaze.
 track_after_ms = 250

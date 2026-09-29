@@ -51,6 +51,7 @@ class X11Pointer:
 
         self.d = display.Display()
         self.root = self.d.screen().root
+        self.scroll_frac = [0.0, 0.0]
 
     def move(self, x: float, y: float):
         self.root.warp_pointer(int(round(x)), int(round(y)))
@@ -63,6 +64,26 @@ class X11Pointer:
     def move_rel(self, dx: float, dy: float):
         x, y = self.position()
         self.move(x + dx, y + dy)
+
+    def scroll(self, dx: float, dy: float):
+        """Scroll by fractional wheel detents, carrying fractions between calls."""
+        from Xlib import X
+        from Xlib.ext import xtest
+
+        self.scroll_frac[0] += dx
+        self.scroll_frac[1] += dy
+        ix, iy = int(self.scroll_frac[0]), int(self.scroll_frac[1])
+        self.scroll_frac[0] -= ix
+        self.scroll_frac[1] -= iy
+        # X11 core wheel events are discrete. Buttons 4/5 are up/down and 6/7
+        # are left/right; high-rate calls still give fine velocity control.
+        for n, neg, pos in ((iy, 4, 5), (ix, 6, 7)):
+            for _ in range(abs(n)):
+                button = pos if n > 0 else neg
+                xtest.fake_input(self.d, X.ButtonPress, button)
+                xtest.fake_input(self.d, X.ButtonRelease, button)
+        if ix or iy:
+            self.d.sync()
 
     def close(self):
         self.d.close()
@@ -86,7 +107,8 @@ class UInputPointer:
             {
                 e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
                 e.EV_ABS: [(e.ABS_X, absinfo), (e.ABS_Y, absinfo)],
-                e.EV_REL: [e.REL_WHEEL],
+                e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL,
+                           e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES],
             },
             name="gazepoint-pointer",
         )
@@ -97,6 +119,8 @@ class UInputPointer:
             {e.EV_KEY: [e.BTN_LEFT], e.EV_REL: [e.REL_X, e.REL_Y]}, name="gazepoint-pointer-rel"
         )
         self.frac = [0.0, 0.0]
+        self.scroll_frac = [0.0, 0.0]
+        self.scroll_legacy = [0, 0]
         time.sleep(0.3)  # let the compositor pick the devices up
 
     def move(self, x: float, y: float):
@@ -121,6 +145,30 @@ class UInputPointer:
             self.rel.write(self.e.EV_REL, self.e.REL_X, ix)
             self.rel.write(self.e.EV_REL, self.e.REL_Y, iy)
             self.rel.syn()
+
+    def scroll(self, dx: float, dy: float):
+        """Emit high-resolution wheel motion; 1.0 is one traditional detent."""
+        # Linux defines 120 high-resolution units per detent. REL_WHEEL is
+        # positive upward, while this API deliberately uses positive downward.
+        vals = [dx * 120, -dy * 120]
+        codes = ((self.e.REL_HWHEEL_HI_RES, self.e.REL_HWHEEL),
+                 (self.e.REL_WHEEL_HI_RES, self.e.REL_WHEEL))
+        wrote = False
+        for axis, (hi_code, legacy_code) in enumerate(codes):
+            self.scroll_frac[axis] += vals[axis]
+            hi = int(self.scroll_frac[axis])
+            if not hi:
+                continue
+            self.scroll_frac[axis] -= hi
+            self.scroll_legacy[axis] += hi
+            self.ui.write(self.e.EV_REL, hi_code, hi)
+            detents = int(self.scroll_legacy[axis] / 120)
+            if detents:
+                self.scroll_legacy[axis] -= detents * 120
+                self.ui.write(self.e.EV_REL, legacy_code, detents)
+            wrote = True
+        if wrote:
+            self.ui.syn()
 
     def close(self):
         self.ui.close()
@@ -209,7 +257,7 @@ class PointerDecoder:
 
 class InputListener(threading.Thread):
     """Calls on_key(down: bool, t) for the hotkey, on_reaim(down, t) for the
-    re-aim key and on_slow(down, t) for the slow-gain key (if any), on_click(t) for left clicks, and on_pointer(record)
+    re-aim, slow-gain, and head-scroll keys (if configured), on_click(t) for left clicks, and on_pointer(record)
     for PointerDecoder records from every pointing device.
 
     Does not grab devices: the keys still reach applications, so pick ones
@@ -219,7 +267,8 @@ class InputListener(threading.Thread):
     def __init__(self, key_name: str, on_key: Callable, on_click: Callable | None = None,
                  reaim_name: str = "", on_reaim: Callable | None = None,
                  on_pointer: Callable[[dict], None] | None = None,
-                 slow_name: str = "", on_slow: Callable | None = None):
+                 slow_name: str = "", on_slow: Callable | None = None,
+                 scroll_name: str = "", on_scroll: Callable | None = None):
         super().__init__(daemon=True, name="input")
         from evdev import ecodes as e
 
@@ -230,6 +279,8 @@ class InputListener(threading.Thread):
             self.handlers[e.ecodes[reaim_name]] = on_reaim
         if slow_name and on_slow:
             self.handlers[e.ecodes[slow_name]] = on_slow
+        if scroll_name and on_scroll:
+            self.handlers[e.ecodes[scroll_name]] = on_scroll
         # The same key on the other side (KEY_RIGHTCTRL <-> KEY_LEFTCTRL): pressing it is
         # the usual reason the hotkey "does nothing", so say so once.
         other = key_name.replace("LEFT", "\0").replace("RIGHT", "LEFT").replace("\0", "RIGHT")
