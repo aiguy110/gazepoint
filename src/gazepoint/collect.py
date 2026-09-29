@@ -3,9 +3,15 @@ with where the user was looking.
 
 One fullscreen window per monitor. Each target shrinks over settle_ms (the user
 saccades to it and settles), then holds for capture_ms while frames are recorded.
-If the raw gaze during the capture doesn't look like a fixation, the presentation
-is listed in session.json's rejected_targets (frames kept, calibration skips them)
-and the point is queued again at the end.
+Every camera frame of a capture is saved and queued; perception runs on its own
+thread in capture order, so a gaze net slower than the camera falls behind during
+captures and catches up while the next target settles (and at the end). Once a
+capture's frames are all processed, if the raw gaze doesn't look like a fixation the
+presentation is listed in session.json's rejected_targets (frames kept, calibration
+skips them) and the point is queued again at the end.
+Space pauses and resumes; a capture interrupted by a pause is rejected the same way
+and its point shown again straight after resuming. A bar along the bottom of every
+screen shows progress.
 After the last target the session is calibrated in place and the windows switch to
 a live gaze view (G skips straight there using the saved calibration).
 """
@@ -20,6 +26,7 @@ import traceback
 import time
 import tkinter as tk
 
+import cv2
 import numpy as np
 
 from . import calib, record
@@ -27,6 +34,10 @@ from .camera import Camera
 from .monitors import Monitor, detect, profile_key
 from .run import clamp_desktop, gaze_px
 from .tracker import Tracker
+
+# Queued capture frames beyond this many are dropped from memory (~2.8 MB each at
+# 720p) and read back from their saved JPEG when their turn comes.
+BACKLOG_IN_MEMORY = 64
 
 
 def grid(n: int) -> list[tuple[float, float]]:
@@ -129,11 +140,23 @@ class Collector:
             cc["jpeg_quality"],
         )
         self.lock = threading.Lock()
+        self.wake = threading.Condition(self.lock)  # capture -> process: new frame
         self.current: dict | None = None  # target being captured
         self.face_ok = False
         self.stop = False
         self.aborted = False
+        self.threads: list[threading.Thread] = []
+        # (frame or None if only on disk, t, seq, target), captured but not yet processed
+        self.backlog: collections.deque = collections.deque()
+        self.unprocessed: collections.Counter = collections.Counter()  # target index -> frames pending
+        self.captured = 0
+        self.processed = 0
+        self.idle: tuple | None = None  # newest (frame, t, seq) outside a capture
         self.gaze: dict[int, list] = {}  # target index -> raw (yaw, pitch) per face frame
+        self.to_judge: dict[int, tuple] = {}  # index -> (monitor, fx, fy): capture over, not judged yet
+        self.pos = 0  # presentation on screen, or the one to show after a pause
+        self.paused = False
+        self.gen = 0  # bumped to cancel the running presentation's animation
         self.rejected: list[int] = []
         self.retries: collections.Counter = collections.Counter()  # (monitor id, fx, fy) -> re-shows
         self.phase = "intro"  # intro -> targets -> calibrating -> view
@@ -145,27 +168,75 @@ class Collector:
 
     # ------------------------------------------------------------ worker
 
-    def worker(self):
+    def capture(self):
+        """Camera -> backlog. During a capture every frame is saved and queued; outside
+        one only the newest is kept (face check, live gaze view)."""
         seq = 0
         while not self.stop:
             try:
                 frame, t, seq = self.cam.next(seq)
             except TimeoutError:
                 continue
-            with self.lock:
+            with self.wake:
                 target = self.current
+                if target is None:
+                    self.idle = (frame, t, seq)
+                    self.wake.notify()
+                    continue
+                # Counted before it's queued so the target isn't judged in between.
+                self.unprocessed[target["index"]] += 1
+                keep = len(self.backlog) < BACKLOG_IN_MEMORY
+            self.writer.save_frame(frame, seq)
+            with self.wake:
+                self.backlog.append((frame if keep else None, t, seq, target))
+                self.captured += 1
+                self.wake.notify()
+
+    def process(self):
+        """Perception in capture order, as fast as the gaze net allows: the backlog
+        first, else the newest idle frame. On stop, whatever is still queued is
+        recorded with obs null (`gazepoint reprocess` fills it in)."""
+        last = 0
+        while True:
+            with self.wake:
+                self.wake.wait_for(
+                    lambda: self.stop or self.backlog or (self.idle is not None and self.idle[2] > last)
+                )
+                if self.stop:
+                    rest = list(self.backlog)
+                    self.backlog.clear()
+                    break
+                if self.backlog:
+                    frame, t, seq, target = self.backlog.popleft()
+                else:
+                    (frame, t, seq), target = self.idle, None
+            last = seq
+            if frame is None:
+                frame = cv2.imread(str(self.writer.frame_path(seq)))
             obs = self.tracker.process(frame, t, seq, keep_landmarks=target is not None)
             self.face_ok = obs is not None
             if target is not None:
                 self.writer.add(frame, seq, t, target, obs.to_json() if obs else None)
-                if obs:
-                    self.gaze.setdefault(target["index"], []).append(obs.gaze_raw)
+                with self.lock:
+                    if obs:
+                        self.gaze.setdefault(target["index"], []).append(obs.gaze_raw)
+                    self.unprocessed[target["index"]] -= 1
+                    self.processed += 1
             view = self.view
             if view and obs:
                 hit = gaze_px(*view, obs)
                 if hit:
                     with self.lock:
                         self.hits.append((t, hit[1], hit[2]))
+        for frame, t, seq, target in rest:
+            self.writer.add(frame, seq, t, target, None)
+
+    def shutdown(self):
+        with self.wake:
+            self.stop = True
+            self.wake.notify_all()
+        for th in self.threads:
+            th.join()
 
     # ------------------------------------------------------------ UI
 
@@ -196,10 +267,13 @@ class Collector:
         self._xcursor = hide_cursor([c.winfo_id() for _, c, _ in self.wins.values()])
         self._builtin()[0].focus_force()
         self.root = root
-        threading.Thread(target=self.worker, daemon=True).start()
+        for fn in (self.capture, self.process):
+            th = threading.Thread(target=fn, name=fn.__name__, daemon=True)
+            th.start()
+            self.threads.append(th)
         self._intro()
         root.mainloop()
-        self.stop = True
+        self.shutdown()
         if self._xcursor:
             self._xcursor.close()
         return self.writer.id
@@ -216,6 +290,8 @@ class Collector:
         elif ev.keysym == "space" and self.phase == "intro":
             self.phase = "targets"
             self._show(0)
+        elif ev.keysym == "space" and self.phase == "targets":
+            self._toggle_pause()
         elif ev.keysym in ("g", "G") and self.phase in ("intro", "targets"):
             print("calibration skipped")
             with self.lock:
@@ -239,19 +315,18 @@ class Collector:
             "Keep your head natural; it's fine (good, even) to shift around between dots.\n"
             "Afterwards you'll see where it thinks you're looking.\n\n"
             f"Face: {'OK' if self.face_ok else 'NOT DETECTED'}\n\n"
-            "Space = start      G = skip calibration, show live gaze      Esc = abort"
+            "Space = start, then pause/resume      G = skip calibration, show live gaze      Esc = abort"
         )
         c.create_text(m.w // 2, m.h // 2, text=msg, fill="white", font=("Sans", 16), justify="center")
         self.root.after(250, self._intro)
 
     def _show(self, i: int):
-        if self.phase != "targets":
+        if self.phase != "targets" or self.paused:
             return
+        self.pos = i
+        self._judge_ready()
         if i >= len(self.targets):
-            if self.do_calibrate:
-                self._calibrate()
-            else:
-                self.root.quit()
+            self._finish()
             return
         m, fx, fy = self.targets[i]
         _, c, _ = self.wins[m.id]
@@ -265,9 +340,10 @@ class Collector:
         cc = self.cfg["collect"]
         t0 = time.monotonic()
         settle, capture = cc["settle_ms"] / 1000, cc["capture_ms"] / 1000
+        gen = self.gen
 
         def frame():
-            if self.phase != "targets":
+            if self.phase != "targets" or gen != self.gen:
                 return
             el = time.monotonic() - t0
             self._clear()
@@ -283,14 +359,92 @@ class Collector:
             else:
                 with self.lock:
                     self.current = None
-                self._judge(i, m, fx, fy)
+                    self.to_judge[i] = (m, fx, fy)
                 self.root.after(1, self._show, i + 1)
                 return
             if not self.face_ok:
                 c.create_text(m.w // 2, 30, text="face not detected", fill="orange", font=("Sans", 14))
+            self._target_progress()
             self.root.after(16, frame)
 
         frame()
+
+    def _toggle_pause(self):
+        if self.paused:
+            self.paused = False
+            self._show(self.pos)
+            return
+        self.paused = True
+        self.gen += 1
+        with self.lock:
+            target, self.current = self.current, None
+        if target is not None:  # mid-capture: reject it and show the same point next
+            i = target["index"]
+            self.rejected.append(i)
+            self.writer.update_meta(rejected_targets=self.rejected)
+            self.targets.insert(i + 1, self.targets[i])
+            self.pos = i + 1
+            print(f"target {i}: interrupted by pause; showing it again")
+        self._draw_paused()
+
+    def _draw_paused(self):
+        if not self.paused or self.phase != "targets":
+            return
+        self._clear()
+        _, c, m = self._builtin()
+        msg = (f"Paused\n\nFace: {'OK' if self.face_ok else 'NOT DETECTED'}\n\n"
+               "Space = resume      G = skip calibration, show live gaze      Esc = abort")
+        c.create_text(m.w // 2, m.h // 2, text=msg, fill="white", font=("Sans", 16), justify="center")
+        self._target_progress()
+        self.root.after(250, self._draw_paused)
+
+    def _finish(self):
+        """After the last target: wait for the backlog to drain and every capture to be
+        judged (which may queue retries), then calibrate."""
+        if self.phase != "targets" or self.paused:
+            return
+        self._judge_ready()
+        if self.pos < len(self.targets):  # retries were queued
+            self._show(self.pos)
+            return
+        if self.to_judge:
+            self._clear()
+            _, c, m = self._builtin()
+            with self.lock:
+                left, done, total = len(self.backlog), self.processed, self.captured
+            c.create_text(m.w // 2, m.h // 2, text=f"Processing recorded frames: {left} left",
+                          fill="white", font=("Sans", 20))
+            self._progress(done, total, f"{done}/{total} frames")
+            self.root.after(100, self._finish)
+            return
+        if self.do_calibrate:
+            self._calibrate()
+        else:
+            self.root.quit()
+
+    def _progress(self, done: int, total: int, label: str):
+        """A thin bar along the bottom of every screen."""
+        h = 6
+        for _, c, m in self.wins.values():
+            c.create_rectangle(0, m.h - h, m.w, m.h, fill="#484848", outline="")
+            c.create_rectangle(0, m.h - h, m.w * done / max(total, 1), m.h, fill="#6fa8dc", outline="")
+            c.create_text(m.w - 12, m.h - h - 4, text=label, fill="#a0a0a0", font=("Sans", 11), anchor="se")
+
+    def _target_progress(self):
+        """Presentations done out of those queued (retries add to the total). Also
+        shows how far perception has fallen behind when it's slower than the camera."""
+        label = f"{self.pos}/{len(self.targets)}"
+        left = len(self.backlog)
+        if left > 30:
+            label += f"  ({left} frames to process)"
+        self._progress(self.pos, len(self.targets), label)
+
+    def _judge_ready(self):
+        """Judge the finished captures whose frames have all been processed."""
+        with self.lock:
+            ready = sorted(i for i in self.to_judge if self.unprocessed[i] == 0)
+        for i in ready:
+            self._judge(i, *self.to_judge.pop(i))
 
     def _judge(self, i: int, m: Monitor, fx: float, fy: float):
         with self.lock:
@@ -382,11 +536,10 @@ def collect(cfg: dict, mode: str = "auto", rounds: int = 1, points: int | None =
     try:
         col.run()
     finally:
-        col.stop = True
+        col.shutdown()
         if col.calib_thread and col.calib_thread.is_alive():
             print("waiting for calibration to finish...")
             col.calib_thread.join()  # never leave calibration files half-written
-        time.sleep(0.2)
         col.writer.close()
         col.cam.close()
         col.tracker.close()
@@ -394,8 +547,9 @@ def collect(cfg: dict, mode: str = "auto", rounds: int = 1, points: int | None =
         shutil.rmtree(col.writer.dir)
         print("no frames recorded; session discarded")
         return None
-    good = len(col.targets) - len(col.rejected)
-    print(f"recorded {col.writer.count} frames, {good}/{len(col.targets)} target presentations kept"
-          + (f" ({len(col.rejected)} rejected as not fixated)" if col.rejected else ""))
+    shown = min(col.pos, len(col.targets))
+    good = shown - len([i for i in col.rejected if i < shown])
+    print(f"recorded {col.writer.count} frames, {good}/{shown} target presentations kept"
+          + (f" ({len(col.rejected)} rejected: not fixated or paused)" if col.rejected else ""))
     print(f"data: {col.writer.dir}")
     return col.writer.id

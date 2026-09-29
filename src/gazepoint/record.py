@@ -51,19 +51,22 @@ class SessionWriter:
         while (item := self._queue.get()) is not None:
             cv2.imwrite(*item)
 
+    def frame_path(self, seq: int) -> Path:
+        return self.dir / "frames" / f"{seq:08d}.jpg"
+
     def save_frame(self, frame, seq: int) -> str:
         """Write frames/<seq>.jpg once (repeat calls are free) and return its name."""
-        name = f"{seq:08d}.jpg"
+        path = self.frame_path(seq)
         with self._lock:
             if seq in self._saved:
-                return name
+                return path.name
             self._saved.add(seq)
-        item = (str(self.dir / "frames" / name), frame, self.q)
+        item = (str(path), frame, self.q)
         if self._queue is not None:
             self._queue.put(item)
         else:
             cv2.imwrite(*item)
-        return name
+        return path.name
 
     def add(self, frame, seq: int, t: float, target: dict | None, obs: dict | None, **extra):
         name = self.save_frame(frame, seq)

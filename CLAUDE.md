@@ -71,6 +71,11 @@ different external monitors.
   that treats the eye as a pinhole camera and gaze vectors as bearings, then
   refined jointly. *Quick* (known monitor set, laptop moved) fits only the
   6-DoF T_cam←anchor from about 5 targets per screen. `auto` picks one.
+  `collect` saves every camera frame of a capture and runs perception on its own
+  thread in capture order, so a slow gaze net (UniGaze-B on the laptop CPU) falls
+  behind during captures and catches up during settles; fixation is judged once a
+  capture's frames are processed. Space pauses (an interrupted capture is rejected
+  and re-shown); a bar along the bottom of every screen shows progress.
   After the last target, `collect` calibrates in place and switches to a live
   gaze view: a trail of raw hits, plus a ring where `run` would latch. **G**
   skips collection and uses the saved calibration.
