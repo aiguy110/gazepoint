@@ -1,0 +1,156 @@
+# gazepoint configuration.
+#
+# This file is the defaults (config.DEFAULTS is loaded from it) and the example:
+# copy it to ~/.config/gazepoint/config.toml and edit. A user config may also
+# hold just the keys it changes; anything missing falls back to these values.
+# Key names are the Linux evdev names (KEY_F14, KEY_RIGHTCTRL, ...; see
+# /usr/include/linux/input-event-codes.h or `evtest`).
+
+[camera]
+# Which camera: a V4L2 index (0), a /dev/videoN path, a device name as
+# `v4l2-ctl --list-devices` shows it (stable across boots, unlike loopback
+# numbers), or a video file path (looped; for testing). On the laptop,
+# "libcamera Camera" is the v4l2loopback feed from /opt/libcamera; "Intel MIPI
+# Camera" is the raw IPU6 pipeline.
+index = "libcamera Camera"
+width = 1280
+height = 720
+fps = 30
+fourcc = "MJPG"  # pixel format asked of the driver: MJPG | YUYV | ...
+# Horizontal field of view used to build the camera intrinsics. Laptop webcams
+# are typically 65-75 deg. Errors mostly scale depth, which calibration largely
+# absorbs.
+hfov_deg = 70.0
+
+[gaze]
+# The gaze net. The per-user correction (user.json) is fit per model, so
+# switching models needs a new `collect`.
+#   unigaze_b16_joint  UniGaze-B (ViT-B/16): the most accurate, ~2x better than
+#                      ETH-XGaze on recorded sessions; ~25 ms on the laptop NPU,
+#                      ~110+ ms on its CPU. Non-commercial weights. 343 MB.
+#   ethxgaze_resnet18  ETH-XGaze ResNet-18: ~2-9 ms anywhere; robust to lighting.
+#   mobileone_s0 | mobilenetv2 | resnet18 | resnet34 | resnet50
+#                      Gaze360 nets: fast, but fail on backlit faces.
+model = "unigaze_b16_joint"
+# Where the gaze net runs:
+#   auto         the Intel NPU through OpenVINO when it's usable, else onnxruntime
+#   npu | gpu    OpenVINO (the GPU needs Intel's OpenCL/Level Zero compute
+#                runtime); see scripts/setup-npu.sh for the NPU driver
+#   onnxruntime  CUDA if present, else CPU
+device = "auto"
+# onnxruntime intra-op threads for the gaze net; 0 = its default (all physical
+# cores). Ignored on the NPU/GPU. `gazepoint bench` times a few settings.
+threads = 0
+# Gaze360 nets only: side of the square face crop fed to the net, relative to
+# the landmark bounding box (they expect RetinaFace-ish boxes).
+crop_scale = 1.0
+# Gaze360 nets only: interpret the output relative to a virtual camera looking
+# straight at the face (how Gaze360 crops are rectified) rather than the real
+# camera axis.
+face_centered = true
+
+[laptop]
+# Camera position relative to the top centre of the built-in panel's active
+# area, in mm (+x toward the user's right, +y up). Both are in the lid, so this
+# never changes.
+camera_above_panel_mm = 8.0
+camera_right_of_center_mm = 0.0
+
+[collect]
+# Targets per screen for `collect --mode full` / `--mode quick`.
+points_full = 9
+points_quick = 5
+settle_ms = 800   # after a target appears, before recording (the saccade + settling)
+capture_ms = 700  # recording time per target
+# Re-show a target (up to fixation_retries times) when its capture doesn't look
+# like a steady fixation: raw gaze too scattered (75th percentile distance from
+# the median, deg), the first and second halves disagreeing (a late saccade or
+# looking away, deg), or fewer than fixation_min_frames frames with a face.
+# Net noise alone is ~5 deg at the 75th percentile.
+fixation_spread_deg = 9.0
+fixation_drift_deg = 10.0
+fixation_min_frames = 5
+fixation_retries = 2
+background = "#303030"
+jpeg_quality = 92  # saved frames (sessions/*/frames), 0-100
+
+[calibrate]
+# Refuse to save a fit (keeping the previous calibration) when the gaze
+# correction has collapsed (smallest singular value of A below min_gain: the
+# fit ignores gaze and parks screens around a constant direction) or more than
+# max_wrong_screen of the frames land on the wrong screen. This happens when
+# the net's raw gaze doesn't track the targets, e.g. a backlit or shadowed
+# face. `calibrate --force` saves anyway.
+min_gain = 0.3
+max_wrong_screen = 0.3
+
+[run]
+# Held for as long as you want to point. The Chocofi sends F14 while its MOUSE
+# layer is held. Not grabbed: other apps still see it.
+hotkey = "KEY_F14"
+# What pressing the hotkey does:
+#   anchor  head motion moves the cursor from where it is, with no jump;
+#           reaim_key jumps to the gaze. The gaze net runs only while the
+#           hotkey is held. On Wayland, where the cursor can't be read, the
+#           head moves it relatively until the first jump unless gazepoint
+#           put it where it is.
+#   jump    jump to the gaze at once (the median over the next latch_ms), then
+#           head motion refines; reaim_key jumps again.
+aim_mode = "anchor"
+# While the hotkey is held: tap to jump to the gaze (the median over the
+# latch_ms *before* the press, so the jump is immediate; mouse buttons held
+# meanwhile stay held, which carries a drag). Hold it longer than
+# track_after_ms and the cursor follows the gaze continuously (see track_*)
+# until it's released; then head motion refines from there. "" disables.
+reaim_key = "KEY_F15"
+# Gaze frames averaged (median) for a jump, in ms.
+latch_ms = 300
+# Run the gaze net on its own thread, on the newest frame, so a slow net
+# doesn't hold back head tracking. Gaze then updates at the net's own rate.
+gaze_thread = true
+# Cursor px per degree of head rotation while the hotkey is held.
+gain_px_per_deg = 30.0
+# Hold this for the lower gain below, for fine positioning ("" disables).
+slow_key = "KEY_F16"
+gain_slow_px_per_deg = 5.0
+
+# Continuous gaze tracking (reaim_key held):
+# How long reaim_key must be held before the cursor starts following the gaze.
+track_after_ms = 250
+# Smoothing of the gaze hits (desktop px) the cursor follows:
+#   one_euro  the One Euro filter: heavy smoothing while the gaze is steady,
+#             little lag once it moves fast (a saccade). track_min_cutoff (Hz)
+#             sets the smoothing when steady (lower = smoother, laggier);
+#             track_beta (per px/s) how fast the cutoff rises with speed
+#             (higher = snappier on saccades, but noise gets through).
+#             With 80 px of gaze noise at 30 Hz, 0.3 / 0.0003 leaves ~17 px of
+#             jitter and settles a 1000 px saccade in ~130 ms.
+#   ema       exponential moving average with time constant track_tau_ms.
+#   median    median of the hits from the last track_window_ms: rejects
+#             outliers (blinks), but jumps in steps.
+#   none      every raw hit (jittery; for comparison).
+track_filter = "one_euro"
+track_min_cutoff = 0.3
+track_beta = 0.0003
+track_tau_ms = 250
+track_window_ms = 400
+
+# Pointer backend: auto (x11 under X11, else uinput) | x11 (XWarpPointer) |
+# uinput (virtual tablet; needs /dev/uinput, see scripts/setup-input-perms.sh).
+pointer_backend = "auto"
+# One Euro filter on the head angles (min cutoff Hz, beta per deg/s).
+one_euro_min_cutoff = 1.0
+one_euro_beta = 0.05
+
+# Usage logging (sessions/*-usage) for later recalibration and training.
+log_usage = true
+# events.jsonl gets every frame's observation plus key, mouse button, wheel,
+# touch, and motion events, so labels can be rederived offline. Webcam frames
+# are saved for this long around every key/button event (~100 KB each at 720p)
+# and, with save_hold_frames, for the whole of every hold.
+context_before_s = 0.5
+context_after_s = 0.3
+save_hold_frames = true
+# X11 only: log (frame ~click_lookback_ms before a click, cursor position) pairs.
+log_clicks = false
+click_lookback_ms = 150

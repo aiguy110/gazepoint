@@ -13,7 +13,7 @@ from gazepoint import calib, config
 from gazepoint.gaze import face_frame, vec_to_angles
 from gazepoint.io import OneEuro, PointerDecoder
 from gazepoint.monitors import Monitor
-from gazepoint.run import GazeWorker, Live
+from gazepoint.run import GazeSmoother, GazeWorker, Live
 from gazepoint.tracker import Observation, Pending
 
 LAPTOP = Monitor("L", "laptop", "eDP-1", 0, 0, 1920, 1200, 300.0, 190.0, True)
@@ -60,8 +60,9 @@ class FakeTracker:
 @pytest.fixture
 def live(tmp_path, monkeypatch):
     monkeypatch.setenv("GAZEPOINT_HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # no user config
     cfg = config.load()
-    cfg["run"]["log_usage"] = False
+    cfg["run"].update(log_usage=False, aim_mode="jump", latch_ms=120, gaze_thread=False)
     lv = object.__new__(Live)
     lv.cfg, lv.mons = cfg, [LAPTOP]
     lv.A = calib.A_IDENTITY
@@ -288,3 +289,67 @@ def test_gaze_worker_thread(live):
     finally:
         live.worker.stop()
         live.worker.join()
+
+
+def test_holding_reaim_follows_the_gaze(live):
+    anchor_mode(live, pos=(100, 200))
+    t = 0.0
+    live.on_key(True, t)
+    for i in range(1, 10):
+        t += 1 / 30
+        live.step(None, t, i)
+    live.on_reaim(True, t)  # tap: jump to the panel centre
+    x, y = live.pointer.moves[-1]
+    assert live.state == "held" and abs(x - 960) < 5
+    for i in range(10, 20):  # keep holding: past track_after_ms
+        t += 1 / 30
+        live.step(None, t, i)
+    assert live.state == "tracking"
+    live.tracker.P = live.screens[0].point_cam(250.0, 95.0)  # look right
+    live.tracker.head_yaw = 20.0  # head motion is ignored while tracking
+    xs = []
+    for i in range(20, 80):
+        t += 1 / 30
+        live.step(None, t, i)
+        xs.append(live.pointer.moves[-1][0])
+    assert all(b >= a - 1e-6 for a, b in zip(xs, xs[1:]))  # glides, no overshoot
+    target = 250.0 / 300.0 * 1920
+    assert abs(xs[-1] - target) < 20 and abs(live.pointer.moves[-1][1] - 600) < 5
+    live.on_reaim(False, t)
+    assert live.state == "held" and live.anchor == live.pos
+    n = len(live.pointer.moves)
+    live.tracker.head_yaw = 22.0  # head refines from where tracking stopped
+    for i in range(80, 110):
+        t += 1 / 30
+        live.step(None, t, i)
+    assert live.pointer.moves[-1][0] > live.pointer.moves[n - 1][0] + 20
+    live.on_key(False, t)
+    assert live.state == "idle"
+
+
+def test_short_reaim_tap_does_not_track(live):
+    t = 0.0
+    live.on_key(True, t)
+    for i in range(1, 8):
+        t += 1 / 30
+        live.step(None, t, i)
+    live.on_reaim(True, t)
+    t += 0.1
+    live.step(None, t, 8)
+    live.on_reaim(False, t)
+    for i in range(9, 30):
+        t += 1 / 30
+        live.step(None, t, i)
+    assert live.state == "held"
+
+
+@pytest.mark.parametrize("kind", ["one_euro", "ema", "median", "none"])
+def test_gaze_smoother(kind):
+    rc = dict(config.DEFAULTS["run"], track_filter=kind)
+    rng = np.random.default_rng(0)
+    sm = GazeSmoother(rc, 0.0, 0.0, 0.0)
+    out = [sm(1000 + rng.normal(0, 100), 500 + rng.normal(0, 100), i / 30) for i in range(1, 91)]
+    end = np.array(out[-30:])
+    assert np.all(np.abs(end.mean(0) - [1000, 500]) < 60)  # converged on the new fixation
+    if kind != "none":
+        assert np.all(end.std(0) < 50)  # and smoothed (raw noise is 100 px)

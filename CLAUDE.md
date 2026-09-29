@@ -28,7 +28,10 @@ different external monitors.
   smoothed with a PID loop; that only adds lag. `run.aim_mode = "anchor"`
   inverts the default: the hotkey only starts head-driven motion from the
   current cursor, and `reaim_key` does the jump, using gaze from the
-  `latch_ms` *before* its press so it's instant. On Wayland the cursor can't
+  `latch_ms` *before* its press so it's instant. Holding `reaim_key` past
+  `track_after_ms` makes the cursor follow the gaze, smoothed per
+  `run.track_filter` (One Euro by default), until it's released; head
+  refinement then continues from there. On Wayland the cursor can't
   be read, so unless gazepoint put it where it is (and no other pointing
   device moved it since), the head moves it through a second, relative uinput
   device until the first jump. `run.gaze_thread` runs the gaze net on its own
@@ -121,7 +124,9 @@ Wayland the cursor position is only known while gazepoint drives it;
 `cursor_trusted` goes false once another device moves it. Clicks logged with `--log-clicks`
 (X11 only) are stored with `obs: null` until `gazepoint reprocess` fills them
 in. Models live in `models/`. User config lives in
-`~/.config/gazepoint/config.toml` (overrides `config.DEFAULTS`).
+`~/.config/gazepoint/config.toml` (overrides `config.DEFAULTS`, which is
+loaded from the commented `src/gazepoint/config.toml`: the defaults *are* the
+laptop's settings and the example to copy; document new settings there).
 
 ## Working on it
 
@@ -178,7 +183,8 @@ in. Models live in `models/`. User config lives in
   right pinky with a 200 ms tapping term, so expect that much lag before the
   hotkey registers.
   The user's Chocofi (`aiguy110/miryoku_zmk`) instead sends F14 while its MOUSE
-  layer is held (no home-row-mod lag) and F15 as `reaim_key` and F16 (left home-row index-inner key) as `slow_key`; its MOUSE thumbs
+  layer is held (no home-row-mod lag) and, on that layer, F15 as `reaim_key` on the left index home key and F16
+  (left index-inner home key) as `slow_key`; its MOUSE thumbs
   click left (RET), right (BSPC), middle (DEL).
   `scripts/setup-input-perms.sh` is needed for `/dev/input` and `/dev/uinput`.
 
