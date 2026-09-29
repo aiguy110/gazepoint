@@ -87,6 +87,9 @@ DEFAULTS: dict = {
         "latch_ms": 120,
         # Cursor px per degree of head rotation while the key is held.
         "gain_px_per_deg": 35.0,
+        # Lower gain for fine positioning while this key is held ("" disables).
+        "slow_key": "",
+        "gain_slow_px_per_deg": 12.0,
         "pointer_backend": "auto",  # auto | x11 | uinput
         "one_euro_min_cutoff": 1.0,
         "one_euro_beta": 0.05,

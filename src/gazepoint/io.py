@@ -185,7 +185,7 @@ class PointerDecoder:
 
 class InputListener(threading.Thread):
     """Calls on_key(down: bool, t) for the hotkey, on_reaim(down, t) for the
-    re-aim key (if any), on_click(t) for left clicks, and on_pointer(record)
+    re-aim key and on_slow(down, t) for the slow-gain key (if any), on_click(t) for left clicks, and on_pointer(record)
     for PointerDecoder records from every pointing device.
 
     Does not grab devices: the keys still reach applications, so pick ones
@@ -194,7 +194,8 @@ class InputListener(threading.Thread):
 
     def __init__(self, key_name: str, on_key: Callable, on_click: Callable | None = None,
                  reaim_name: str = "", on_reaim: Callable | None = None,
-                 on_pointer: Callable[[dict], None] | None = None):
+                 on_pointer: Callable[[dict], None] | None = None,
+                 slow_name: str = "", on_slow: Callable | None = None):
         super().__init__(daemon=True, name="input")
         from evdev import ecodes as e
 
@@ -203,6 +204,8 @@ class InputListener(threading.Thread):
         self.handlers = {e.ecodes[key_name]: on_key}
         if reaim_name and on_reaim:
             self.handlers[e.ecodes[reaim_name]] = on_reaim
+        if slow_name and on_slow:
+            self.handlers[e.ecodes[slow_name]] = on_slow
         # The same key on the other side (KEY_RIGHTCTRL <-> KEY_LEFTCTRL): pressing it is
         # the usual reason the hotkey "does nothing", so say so once.
         other = key_name.replace("LEFT", "\0").replace("RIGHT", "LEFT").replace("\0", "RIGHT")

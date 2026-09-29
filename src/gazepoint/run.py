@@ -15,7 +15,7 @@ raw stream in events.jsonl, from which labels can be rederived offline:
 
   session  t, wall            clock alignment (wall = time.time() at monotonic t)
   frame    t, seq, state, obs, gaze [x, y] (current calibration), cursor
-  key      t, key (aim|reaim), down, state
+  key      t, key (aim|reaim|slow), down, state
   jump     t, anchor, n (gaze frames in the median)
   button   t, dev, button, down, cursor, cursor_trusted, state
   wheel    t, dev, dx|dy          touch  t, dev, down
@@ -86,7 +86,8 @@ class Live:
             log_clicks = False
         self.listener = InputListener(rc["hotkey"], self.on_key, self.on_click if log_clicks else None,
                                       rc["reaim_key"], self.on_reaim,
-                                      self.on_pointer if rc["log_usage"] else None)
+                                      self.on_pointer if rc["log_usage"] else None,
+                                      rc["slow_key"], self.on_slow)
 
     def _init_state(self):
         rc = self.cfg["run"]
@@ -96,6 +97,8 @@ class Live:
         self.latch_warned = False
         self.anchor = None
         self.head0 = None
+        self.angles = None  # latest filtered (yaw, pitch)
+        self.slow = False  # slow-gain key held
         self.pos = None
         self.events = 0
         self.writer = None
@@ -160,6 +163,15 @@ class Live:
                 self._log_segment()
                 self.state, self.latch_t, self.latch, self.latch_warned = "latching", t, [], False
                 print("re-aim: reading gaze")
+
+    def on_slow(self, down: bool, t: float):
+        """Hold for the low head gain. Re-anchors at the current cursor so the
+        cursor doesn't jump when the gain changes."""
+        with self.lock:
+            self._event({"type": "key", "t": t, "key": "slow", "down": down, "state": self.state})
+            self.slow = down
+            if self.state == "held" and self.angles:
+                self.anchor, self.head0 = self.pos, self.angles
 
     def on_pointer(self, rec: dict):
         """Raw pointing-device event from the input thread (io.PointerDecoder)."""
@@ -227,6 +239,7 @@ class Live:
             self._record_frame(frame, t, seq, obs, hit)
 
     def _step_locked(self, frame, t, seq, obs, hit, yaw, pitch, rc):
+        self.angles = (yaw, pitch)
         if self.state == "latching":
             if hit:
                 self.latch.append((frame, obs, hit))
@@ -243,7 +256,7 @@ class Live:
                 self._event({"type": "jump", "t": t, "anchor": [x, y], "n": len(self.latch)})
                 print(f"jump to ({x:.0f}, {y:.0f}) on {m.name}, median of {len(self.latch)} gaze frames")
         elif self.state == "held":
-            g = rc["gain_px_per_deg"]
+            g = rc["gain_slow_px_per_deg"] if self.slow else rc["gain_px_per_deg"]
             x = self.anchor[0] + g * (yaw - self.head0[0])
             y = self.anchor[1] - g * (pitch - self.head0[1])
             self.pos = clamp_desktop(self.mons, x, y)[:2]

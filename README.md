@@ -55,6 +55,7 @@ MOUSE thumb also holds F14, and `'` on that layer is F15):
 [run]
 hotkey = "KEY_F14"
 reaim_key = "KEY_F15"   # jump to the gaze again mid-hold, e.g. to finish a drag
+slow_key = "KEY_F16"    # hold for the low head gain (gain_slow_px_per_deg) while pointing
 ```
 
 ## Getting data off the laptop

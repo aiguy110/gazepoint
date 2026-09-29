@@ -118,6 +118,28 @@ def test_reaim_jumps_while_held(live):
     assert live.state == "idle"
 
 
+def test_slow_key_lowers_gain_without_jumping(live):
+    t = 0.0
+    live.on_key(True, t)
+    for i in range(1, 8):
+        t += 1 / 30
+        live.step(None, t, i)
+    live.tracker.head_yaw = 5.0
+    for i in range(8, 30):
+        t += 1 / 30
+        live.step(None, t, i)
+    x0 = live.pointer.moves[-1][0]
+    live.on_slow(True, t)
+    live.tracker.head_yaw = 10.0
+    for i in range(30, 60):
+        t += 1 / 30
+        live.step(None, t, i)
+    x1 = live.pointer.moves[-1][0]
+    live.on_slow(False, t)
+    assert 0 < x1 - x0 < 0.6 * 5 * live.cfg["run"]["gain_px_per_deg"]  # 5 deg at the low gain
+    live.on_key(False, t)
+
+
 def test_reaim_ignored_when_idle(live):
     live.on_reaim(True, 0.0)
     assert live.state == "idle"
