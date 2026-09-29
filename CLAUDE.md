@@ -150,8 +150,12 @@ in. Models live in `models/`. User config lives in
   a compiler.
 - Gaze-net cost on bifrost (Ryzen 7 3700X, onnxruntime): ETH-XGaze ~7–9 ms,
   UniGaze-B ~60 ms at 8 threads (~90 at 4); landmarks ~12 ms. The laptop
-  (Core Ultra 7, 22 threads) is likely at least as fast; measure it there with
-  `gazepoint bench` and set `gaze.threads`.
+  (Core Ultra 7 165H) is slower on the CPU: UniGaze-B ~110 ms idle and 500+
+  ms under load. Its NPU (via OpenVINO, `gaze.device = auto`) runs UniGaze-B in
+  ~23–25 ms and ETH-XGaze in ~2–5 ms, within 0.1° of the CPU. The first NPU
+  compile takes ~10 s and is cached in `models/openvino_cache`. The NPU needs
+  `scripts/setup-npu.sh` (userspace driver + `render` group). `gazepoint bench
+  --devices auto,npu,onnxruntime` compares backends.
 
 ## Not yet verified on real hardware (check these first)
 

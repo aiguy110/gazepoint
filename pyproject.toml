@@ -11,6 +11,8 @@ dependencies = [
   "opencv-contrib-python>=4.9",
   "mediapipe>=0.10.14,<2",
   "onnxruntime>=1.18",
+  # the laptop's Intel NPU (gaze.device); needs scripts/setup-npu.sh for the driver
+  "openvino>=2025.0",
   # ETH-XGaze weights ship as safetensors; converted to ONNX at download time
   "onnx>=1.16",
   "safetensors>=0.4",

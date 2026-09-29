@@ -40,6 +40,12 @@ DEFAULTS: dict = {
         # Gaze360 net: mobileone_s0 | mobilenetv2 | resnet18 | resnet34 |
         # resnet50. The per-user correction is fit per model.
         "model": "ethxgaze_resnet18",
+        # Where the gaze net runs: auto (the Intel NPU through OpenVINO when it's
+        # usable, else onnxruntime), npu, gpu (OpenVINO; the GPU needs Intel's
+        # OpenCL/Level Zero compute runtime), or onnxruntime (CUDA if present,
+        # else CPU). On the Meteor Lake laptop the NPU runs UniGaze-B in ~23 ms
+        # vs ~110+ ms on the CPU. See scripts/setup-npu.sh.
+        "device": "auto",
         # onnxruntime intra-op threads for the gaze net; 0 = its default (all
         # physical cores). `gazepoint bench` times a few settings.
         "threads": 0,

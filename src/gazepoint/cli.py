@@ -43,6 +43,16 @@ def cmd_doctor(cfg, args):
     except Exception as e:  # noqa: BLE001
         line("FAIL", "onnxruntime", str(e))
     try:
+        from .gaze import openvino_devices
+
+        ov = openvino_devices()
+        want = cfg["gaze"]["device"]
+        bad = want in ("npu", "gpu") and want.upper() not in ov
+        line("FAIL" if bad else "ok", "OpenVINO devices",
+             f"{', '.join(ov)} (gaze.device = {want})" + ("; see scripts/setup-npu.sh" if bad else ""))
+    except Exception as e:  # noqa: BLE001
+        line("FAIL", "OpenVINO", str(e))
+    try:
         mons = detect()
         for m in mons:
             line("ok", "monitor", f"{m.name} [{m.id}] {m.connector} {m.w}x{m.h}+{m.x}+{m.y} "
@@ -187,15 +197,20 @@ def cmd_download(cfg, args):
 
 
 def cmd_bench(cfg, args):
-    """Gaze-net latency per model and thread count (a random input; no camera needed)."""
+    """Gaze-net latency per model, device, and (onnxruntime) thread count, on a random
+    input; no camera needed. A device's first NPU compile is slow and not timed."""
     import os
     import time
 
     import numpy as np
 
-    from .gaze import GazeNet, NormalizedGazeNet
+    from .gaze import DEVICES, GazeNet, NormalizedGazeNet
 
     names = args.models or [cfg["gaze"]["model"]]
+    devices = args.devices.split(",") if args.devices else [cfg["gaze"]["device"]]
+    for d in devices:
+        if d not in DEVICES:
+            sys.exit(f"unknown device {d!r}; choose from {DEVICES}")
     threads = [int(n) for n in args.threads.split(",")]
     print(f"{os.cpu_count()} logical CPUs; threads 0 = onnxruntime default")
     for name in names:
@@ -203,16 +218,24 @@ def cmd_bench(cfg, args):
             sys.exit(f"unknown gaze model {name!r}; choose from {models.GAZE_MODELS}")
         models.fetch_gaze(name)
         path = str(models.gaze_model_path(name))
-        for n in threads:
-            net = NormalizedGazeNet(path, n) if models.is_normalized(name) else GazeNet(path, threads=n)
-            face = np.random.randint(0, 255, (224, 224, 3), np.uint8)
-            for _ in range(3):
-                net(face)
-            k = 20
-            t = time.perf_counter()
-            for _ in range(k):
-                net(face)
-            print(f"  {name:20s} threads {n:2d}: {(time.perf_counter() - t) / k * 1000:6.1f} ms", flush=True)
+        for dev in devices:
+            for n in threads if dev == "onnxruntime" else [0]:
+                t = time.perf_counter()
+                if models.is_normalized(name):
+                    net = NormalizedGazeNet(path, n, dev)
+                else:
+                    net = GazeNet(path, threads=n, device=dev)
+                load = time.perf_counter() - t
+                face = np.random.randint(0, 255, (224, 224, 3), np.uint8)
+                for _ in range(3):
+                    net(face)
+                k = 20
+                t = time.perf_counter()
+                for _ in range(k):
+                    net(face)
+                what = f"threads {n:2d}" if net.device.startswith("onnxruntime") else ""
+                print(f"  {name:20s} {net.device:36s} {what:10s} {(time.perf_counter() - t) / k * 1000:6.1f} ms"
+                      f"  (load {load:.1f} s)", flush=True)
 
 
 def main(argv=None):
@@ -223,7 +246,8 @@ def main(argv=None):
     d.add_argument("--gaze", nargs="*", help=f"gaze models to fetch ({', '.join(models.GAZE_MODELS)})")
     b = sub.add_parser("bench", help="time the gaze net(s) at several thread counts")
     b.add_argument("models", nargs="*", help="gaze models (default: the configured one)")
-    b.add_argument("--threads", default="1,2,4,8,12,0", help="comma-separated thread counts")
+    b.add_argument("--devices", help="comma-separated gaze.device values (default: the configured one)")
+    b.add_argument("--threads", default="1,2,4,8,12,0", help="comma-separated onnxruntime thread counts")
     sub.add_parser("monitors", help="print detected monitors and profile key")
     sub.add_parser("preview", help="webcam preview with gaze/head overlays")
     c = sub.add_parser("collect", help="show fixation targets, record labelled frames, calibrate, then show live gaze")

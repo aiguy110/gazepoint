@@ -11,9 +11,14 @@ right, pitch > 0 looks up.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import cv2
 import numpy as np
 import onnxruntime as ort
+
+from . import config
 
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -54,18 +59,86 @@ def inference_session(path: str, threads: int = 0) -> ort.InferenceSession:
     return ort.InferenceSession(path, opts, providers=providers)
 
 
+DEVICES = ("auto", "npu", "gpu", "onnxruntime")
+
+
+def openvino_devices() -> list[str]:
+    try:
+        import openvino as ov
+    except ImportError:
+        return []
+    return ov.Core().available_devices
+
+
+class Engine:
+    """An ONNX net on one backend: OpenVINO on the Intel NPU or GPU ("npu", "gpu";
+    compiled for a fixed 1x3xHxW input, cached under models/openvino_cache since
+    the first compile takes seconds), or onnxruntime ("onnxruntime": CUDA if
+    present, else CPU with `threads`). "auto" = the NPU when OpenVINO can use it,
+    else onnxruntime. engine(x) -> the net's outputs, in order."""
+
+    def __init__(self, path: str, device: str = "auto", threads: int = 0, size: tuple[int, int] = (224, 224)):
+        if device not in DEVICES:
+            raise ValueError(f"gaze.device {device!r}: choose from {DEVICES}")
+        self._req = self.session = None
+        if device == "auto":
+            if "NPU" not in openvino_devices():
+                if os.path.exists("/dev/accel/accel0") and not os.access("/dev/accel/accel0", os.R_OK | os.W_OK):
+                    print("WARNING: there's an NPU but no access to /dev/accel/accel0 (join 'render' and "
+                          "log in again; scripts/setup-npu.sh); using onnxruntime", file=sys.stderr)
+            else:
+                try:
+                    self._openvino(path, "NPU", size)
+                except Exception as e:  # noqa: BLE001 - e.g. no access to /dev/accel
+                    print(f"WARNING: NPU unusable ({e}); using onnxruntime", file=sys.stderr)
+            if self._req is None:
+                device = "onnxruntime"
+        elif device in ("npu", "gpu"):
+            have = openvino_devices()
+            if device.upper() not in have:
+                raise RuntimeError(
+                    f"OpenVINO sees no {device.upper()} (only {have}); the NPU needs "
+                    "scripts/setup-npu.sh and a fresh login for the 'render' group"
+                )
+            self._openvino(path, device.upper(), size)
+        if device == "onnxruntime":
+            self.session = inference_session(path, threads)
+            inp = self.session.get_inputs()[0]
+            self.input_name = inp.name
+            h, w = inp.shape[2], inp.shape[3]
+            self.size = (w if isinstance(w, int) else size[0], h if isinstance(h, int) else size[1])
+            self.device = f"onnxruntime {self.session.get_providers()[0]}"
+
+    def _openvino(self, path: str, dev: str, size: tuple[int, int]):
+        import openvino as ov
+
+        core = ov.Core()
+        core.set_property({"CACHE_DIR": str(config.models_dir() / "openvino_cache")})
+        model = core.read_model(path)
+        shape = model.inputs[0].get_partial_shape()
+        h = shape[2].get_length() if shape[2].is_static else size[1]
+        w = shape[3].get_length() if shape[3].is_static else size[0]
+        model.reshape([1, 3, h, w])
+        self._req = core.compile_model(model, dev, {"PERFORMANCE_HINT": "LATENCY"}).create_infer_request()
+        self.size = (w, h)
+        self.device = f"OpenVINO {dev}"
+
+    def __call__(self, x: np.ndarray) -> list[np.ndarray]:
+        if self._req is not None:
+            return list(self._req.infer({0: x}).to_tuple())
+        return self.session.run(None, {self.input_name: x})
+
+
 class GazeNet:
     """L2CS-style binned-regression net: face crop -> (yaw, pitch) radians."""
 
-    def __init__(self, path: str, bins: int = 90, binwidth: float = 4.0, offset: float = 180.0, threads: int = 0):
-        self.session = inference_session(path, threads)
-        inp = self.session.get_inputs()[0]
-        self.input_name = inp.name
-        h, w = inp.shape[2], inp.shape[3]
-        self.size = (int(w) if isinstance(w, int) else 448, int(h) if isinstance(h, int) else 448)
+    def __init__(self, path: str, bins: int = 90, binwidth: float = 4.0, offset: float = 180.0,
+                 threads: int = 0, device: str = "auto"):
+        self.engine = Engine(path, device, threads, size=(448, 448))
+        self.size = self.engine.size
         self.idx = np.arange(bins, dtype=np.float32)
         self.binwidth, self.offset = binwidth, offset
-        self.providers = self.session.get_providers()
+        self.device = self.engine.device
 
     def _decode(self, logits: np.ndarray) -> np.ndarray:
         e = np.exp(logits - logits.max(axis=1, keepdims=True))
@@ -75,7 +148,7 @@ class GazeNet:
     def __call__(self, crop_bgr: np.ndarray) -> tuple[float, float]:
         img = cv2.cvtColor(cv2.resize(crop_bgr, self.size), cv2.COLOR_BGR2RGB)
         x = ((img.astype(np.float32) / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)[None]
-        yaw_logits, pitch_logits = self.session.run(None, {self.input_name: x})
+        yaw_logits, pitch_logits = self.engine(x)
         return float(self._decode(yaw_logits)[0]), float(self._decode(pitch_logits)[0])
 
 
@@ -101,15 +174,14 @@ class NormalizedGazeNet:
     """Regression net on ETH-XGaze-normalised faces (hysts/ptgaze ResNet-18, UniGaze):
     normalised 224x224 face -> gaze direction in the normalised camera frame."""
 
-    def __init__(self, path: str, threads: int = 0):
-        self.session = inference_session(path, threads)
-        self.input_name = self.session.get_inputs()[0].name
-        self.providers = self.session.get_providers()
+    def __init__(self, path: str, threads: int = 0, device: str = "auto"):
+        self.engine = Engine(path, device, threads)
+        self.device = self.engine.device
 
     def __call__(self, face_bgr: np.ndarray) -> np.ndarray:
         img = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
         x = ((img.astype(np.float32) / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)[None]
-        pitch, yaw = self.session.run(None, {self.input_name: x})[0][0]
+        pitch, yaw = self.engine(x)[0][0]
         # ETH-XGaze labels point from the target back at the face; flip to a gaze direction.
         # That makes it the same form as angles_to_vec, just in the normalised frame.
         return angles_to_vec(float(yaw), float(pitch))

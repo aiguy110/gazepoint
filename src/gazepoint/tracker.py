@@ -97,8 +97,11 @@ class Tracker:
         self.model = cfg["gaze"]["model"]
         self.normalized = models.is_normalized(self.model)
         path = str(models.gaze_model_path(self.model))
-        threads = cfg["gaze"]["threads"]
-        self.net = NormalizedGazeNet(path, threads) if self.normalized else GazeNet(path, threads=threads)
+        threads, device = cfg["gaze"]["threads"], cfg["gaze"]["device"]
+        if self.normalized:
+            self.net = NormalizedGazeNet(path, threads, device)
+        else:
+            self.net = GazeNet(path, threads=threads, device=device)
         c = self.canonical
         self.face_center = (c[_EYE_CORNERS].mean(axis=0) + c[_NOSTRILS].mean(axis=0)) / 2
         self._rvec = None
