@@ -129,7 +129,11 @@ in. Models live in `models/`. User config lives in
   pass and, where it matters, it has been run on the target), commit it,
   fast-forward merge it into `main`, and push to `origin` without asking first.
   The laptop picks up changes through `git pull`, so an unpushed fix doesn't
-  exist as far as it's concerned.
+  exist as far as it's concerned. Update the local `main` too, not just
+  `origin/main`. When working in a worktree, `main` is checked out in the main
+  checkout (first line of `git worktree list`), so fast-forward it there:
+  `git -C <main checkout> merge --ff-only <branch>`. Don't touch it if that
+  checkout has uncommitted changes or the merge isn't a fast-forward; say so.
 - `uv run pytest`: synthetic end-to-end calibration (full, then quick after
   "moving the laptop"), EDID parsing, and the live-mode state machine. Keep
   these passing; add synthetic tests for new fitting logic.
