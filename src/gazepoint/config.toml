@@ -171,11 +171,12 @@ one_euro_beta = 0.05
 log_usage = true
 # events.jsonl gets every frame's observation plus key, mouse button, wheel,
 # touch, and motion events, so labels can be rederived offline. Webcam frames
-# are saved for this long around every key/button event (~100 KB each at 720p)
-# and, with save_hold_frames, for the whole of every hold.
+# are saved for this long around every key/button event (~400 KB each at 720p
+# from the libcamera feed) and, with save_hold_frames, for the whole of every
+# hold. Hold frames ran to ~18 GB a day with the hotkey on a held layer.
 context_before_s = 0.5
 context_after_s = 0.3
-save_hold_frames = true
+save_hold_frames = false
 # X11 only: log (frame ~click_lookback_ms before a click, cursor position) pairs.
 log_clicks = false
 click_lookback_ms = 150
