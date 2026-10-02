@@ -6,7 +6,11 @@ Everything stateful lives under GAZEPOINT_HOME (default ~/.local/share/gazepoint
     sessions/<id>/          recorded data: session.json, samples.jsonl, frames/*.jpg
     profiles/<hash>.json    monitor constellations, keyed by the set of external monitors
     user.json               per-user gaze correction (independent of desk setup)
+    users/<name>/user.json  the same for user profile <name> (`--profile`)
     current.json            camera pose for the current desk session
+
+Monitor constellations and the camera pose are physical, so every user profile
+shares them; only the gaze correction is per user.
 
 Pointing GAZEPOINT_HOME at a pulled data dir (data/<host>) lets you re-run
 calibrate/eval on the dev box against data gathered on the laptop.
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import tomllib
 from pathlib import Path
 
@@ -31,6 +36,32 @@ def home() -> Path:
     p = Path(os.environ.get("GAZEPOINT_HOME", Path.home() / ".local/share/gazepoint"))
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def user_profile() -> str | None:
+    """The user profile (`--profile`, or GAZEPOINT_PROFILE); None = the default user."""
+    return os.environ.get("GAZEPOINT_PROFILE") or None
+
+
+def set_user_profile(name: str):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise ValueError(f"bad profile name {name!r}: use letters, digits, '_', '.', '-'")
+    os.environ["GAZEPOINT_PROFILE"] = name
+
+
+def profile_flag() -> str:
+    """' --profile <name>' for commands suggested in messages, or ''."""
+    return f" --profile {user_profile()}" if user_profile() else ""
+
+
+def user_dir() -> Path:
+    """Where the current user profile's gaze correction lives."""
+    name = user_profile()
+    if not name:
+        return home()
+    d = home() / "users" / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def models_dir() -> Path:

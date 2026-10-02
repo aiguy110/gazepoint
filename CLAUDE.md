@@ -64,7 +64,11 @@ different external monitors.
      with the gaze model it was fit for and ignored for any other model. Once
      it exists, a full calibration at a new desk reuses it and fits only
      monitor poses (`--refit-user` to refit). At some desks the laptop panel is
-     a poor gauge, e.g. looked at steeply down through glare.
+     a poor gauge, e.g. looked at steeply down through glare. It's the only
+     per-person layer: `--profile <name>` (collect/calibrate/eval/run/doctor,
+     or `GAZEPOINT_PROFILE`) keeps it in `users/<name>/user.json`, while
+     layers 2 and 3 are physical and shared by every profile. Sessions record
+     `user_profile`, and `calibrate`/`eval` use it unless `--profile` is given.
   2. `profiles/<sha1(key)[:12]>.json`: external monitor poses relative to an
      anchor monitor. The key is the sorted EDID ids of the external monitors
      (`monitors.profile_key`).
@@ -76,7 +80,12 @@ different external monitors.
   set) fits `A` plus a 6-DoF pose per external monitor, initialised by PnP
   that treats the eye as a pinhole camera and gaze vectors as bearings, then
   refined jointly. *Quick* (known monitor set, laptop moved) fits only the
-  6-DoF T_cam←anchor from about 5 targets per screen. `auto` picks one.
+  6-DoF T_cam←anchor from about 5 targets per screen. `auto` picks one: quick
+  at any known desk, even for a profile with no `A` yet. Then `A` is fit
+  jointly with T_cam←anchor against the saved constellation (and `points_full`
+  targets are shown), so a second person doesn't refit or disturb the desk. An
+  explicit full fit adds the saved desk's poses (if `current.json` matches) to
+  the PnP initial candidates.
   `collect` saves every camera frame of a capture and runs perception on its own
   thread in capture order, so a slow gaze net (UniGaze-B on the laptop CPU) falls
   behind during captures and catches up during settles; fixation is judged once a

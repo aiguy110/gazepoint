@@ -29,12 +29,12 @@ def ext_poses(yaw_deg=0.0, shift=(0.0, 0.0, 0.0)):
     return {EXT.id: compose(M, s, R_dell, t_dell), EXT2.id: compose(M, s, R_len, t_len)}
 
 
-def synth(poses, per_screen, frames=12, noise_deg=1.2, seed=0):
+def synth(poses, per_screen, frames=12, noise_deg=1.2, seed=0, A=A_TRUE):
     rng = np.random.default_rng(seed)
     screens = calib.screens_from_monitors([LAPTOP, EXT, EXT2], CFG)
     for sid, (R, t) in poses.items():
         screens[sid].R, screens[sid].t = R, t
-    Ainv = np.linalg.inv(np.vstack([A_TRUE, [0, 0, 1]]))[:2]
+    Ainv = np.linalg.inv(np.vstack([A, [0, 0, 1]]))[:2]
     recs, idx = [], 0
     for sid, sc in screens.items():
         for fx in np.linspace(0.08, 0.92, 3):
@@ -74,9 +74,9 @@ def test_laptop_panel_pose():
     assert s.point_cam(300, 0)[0] < 0  # user's right = camera -x
 
 
-def clean_error(poses, A, screens, seed):
+def clean_error(poses, A, screens, seed, A_user=A_TRUE):
     """Median angular error (deg) per screen of a fitted model on noise-free data."""
-    s = calib.Samples.from_records(synth(poses, 9, noise_deg=0.0, seed=seed))
+    s = calib.Samples.from_records(synth(poses, 9, noise_deg=0.0, seed=seed, A=A_user))
     return {k: v["deg"]["median"] for k, v in calib.evaluate(s, A, list(screens.values())).items()}
 
 
@@ -161,3 +161,42 @@ def test_user_correction_is_per_gaze_model():
     assert calib.load_user("some_other_model") is None
     with pytest.raises(calib.NotCalibrated):
         calib.load_runtime([LAPTOP, EXT, EXT2], {**CFG, "gaze": {**CFG["gaze"], "model": "some_other_model"}})
+
+
+A_BOB = np.array([[0.93, -0.05, -3.5], [0.06, 1.1, 4.0]])
+
+
+def test_new_profile_fits_its_own_correction_at_a_known_desk(tmp_path, monkeypatch):
+    """A second person at a calibrated desk gets their own A, fit against the saved
+    constellation; the first user's calibration and the desk are left alone."""
+    from gazepoint.collect import choose_mode
+
+    mons = [LAPTOP, EXT, EXT2]
+    truth = ext_poses()
+    A1, _, _ = calib.calibrate(synth(truth, 9), mons, CFG, "full", False, "s1")
+    prof = next((tmp_path / "profiles").iterdir())
+    desk = prof.read_text()
+
+    monkeypatch.setenv("GAZEPOINT_PROFILE", "bob")
+    assert calib.load_user(CFG["gaze"]["model"]) is None
+    assert choose_mode(mons) == "quick"
+    A2, screens, rep = calib.calibrate(synth(truth, 9, seed=2, A=A_BOB), mons, CFG, "quick", False, "s2")
+    assert np.abs(A2[:, :2] - A_BOB[:, :2]).max() < 0.15
+    for name, err in clean_error(truth, A2, screens, seed=7, A_user=A_BOB).items():
+        assert err < 1.0, (name, err)
+    assert (tmp_path / "users" / "bob" / "user.json").exists()
+    assert prof.read_text() == desk
+    calib.load_runtime(mons, CFG)
+
+    monkeypatch.delenv("GAZEPOINT_PROFILE")
+    assert np.allclose(calib.load_user(CFG["gaze"]["model"]), A1)
+
+
+def test_full_fit_for_a_new_profile_is_seeded_by_the_saved_desk(monkeypatch):
+    mons = [LAPTOP, EXT, EXT2]
+    truth = ext_poses()
+    calib.calibrate(synth(truth, 9), mons, CFG, "full", False, "s1")
+    monkeypatch.setenv("GAZEPOINT_PROFILE", "bob")
+    A, screens, _ = calib.calibrate(synth(truth, 9, seed=3, A=A_BOB), mons, CFG, "full", False, "s2")
+    for name, err in clean_error(truth, A, screens, seed=8, A_user=A_BOB).items():
+        assert err < 1.0, (name, err)

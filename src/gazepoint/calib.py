@@ -3,7 +3,8 @@
 Three layers, persisted separately because they change on different timescales:
 
   user.json      A: 2x3 affine on the net's (yaw, pitch) in degrees. Absorbs the
-                 user's kappa angle and model bias. Same at every desk.
+                 user's kappa angle and model bias. Same at every desk. One per
+                 user profile (config.user_dir); the other two layers are shared.
   profiles/*     Constellation: pose of each external monitor relative to an
                  anchor monitor. One per set of external monitors (EDID ids).
   current.json   T_cam<-anchor for the current placement of the laptop.
@@ -333,7 +334,7 @@ LEGACY_GAZE_MODEL = "mobileone_s0"
 
 def load_user(gaze_model: str) -> np.ndarray | None:
     """The saved correction, if it was fit for this gaze model (A is model-specific)."""
-    d = _read(config.home() / "user.json")
+    d = _read(config.user_dir() / "user.json")
     if not d or d.get("gaze_model", LEGACY_GAZE_MODEL) != gaze_model:
         return None
     return np.array(d["A"])
@@ -458,6 +459,13 @@ def calibrate(
             raise RuntimeError("quick calibration needs targets on at least one external monitor")
         report["anchor"] = prof["anchor"]
 
+    # Where the saved desk puts each monitor now, if the laptop hasn't moved since
+    # (e.g. a new user profile at a calibrated desk): seeds the full fit.
+    seeds = {}
+    if mode == "full" and (prof := load_profile(key)) and (cur := load_current()) and cur.get("profile_key") == key:
+        GR, Gt = _pose_load(cur)
+        seeds = {sid: compose(GR, Gt, *_pose_load(prof["monitors"][sid])) for sid in ext_ids if sid in prof["monitors"]}
+
     def fit(s):
         lap = s.subset(s.screen == bid)
         if fit_A and len(np.unique(lap.target_idx)) >= 4:
@@ -469,7 +477,8 @@ def calibrate(
             for sid in ext_ids:
                 sub = s.subset(s.screen == sid)
                 best = None
-                for R0, t0 in init_pose_candidates(sub, A, screens[sid].size_mm):
+                cands = init_pose_candidates(sub, A, screens[sid].size_mm) + ([seeds[sid]] if sid in seeds else [])
+                for R0, t0 in cands:
                     g = Group(R0, t0, {sid: (np.eye(3), np.zeros(3))})
                     trial = {sid: Screen(**{**screens[sid].__dict__})}
                     _, c = joint_fit(sub, trial, [g], A, fit_A=False)
@@ -490,7 +499,7 @@ def calibrate(
             best = None
             for R0, t0 in cands:
                 trial = {k: Screen(**{**v.__dict__}) for k, v in screens.items()}
-                A_fit, cost = joint_fit(s, trial, [Group(R0, t0, offsets)], A, fit_A=refit_user)
+                A_fit, cost = joint_fit(s, trial, [Group(R0, t0, offsets)], A, fit_A=fit_A)
                 if best is None or cost < best[1]:
                     best = (A_fit, cost, trial)
             return best
@@ -528,7 +537,7 @@ def calibrate(
 
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     if fit_A:
-        _write(config.home() / "user.json", {"A": A.tolist(), "gaze_model": gaze_model, "updated": now, "session": session})
+        _write(config.user_dir() / "user.json", {"A": A.tolist(), "gaze_model": gaze_model, "updated": now, "session": session})
     if ext_ids:
         anchor = pick_anchor(screens) if mode == "full" else report["anchor"]
         a = screens[anchor]
@@ -561,7 +570,10 @@ def load_runtime(mons: list[Monitor], cfg: dict) -> tuple[np.ndarray, list[Scree
     """A and camera-frame screens for the currently connected monitors."""
     A = load_user(cfg["gaze"]["model"])
     if A is None:
-        raise NotCalibrated(f"no user calibration for gaze model {cfg['gaze']['model']}; run `gazepoint collect`")
+        raise NotCalibrated(
+            f"no user calibration{' for profile ' + config.user_profile() if config.user_profile() else ''}"
+            f" for gaze model {cfg['gaze']['model']}; run `gazepoint collect{config.profile_flag()}`"
+        )
     screens = screens_from_monitors(mons, cfg)
     key = profile_key(mons)
     ext_ids = [sid for sid, s in screens.items() if not s.builtin]
@@ -569,9 +581,11 @@ def load_runtime(mons: list[Monitor], cfg: dict) -> tuple[np.ndarray, list[Scree
         prof = load_profile(key)
         cur = load_current()
         if prof is None:
-            raise NotCalibrated(f"unknown monitor set; run `gazepoint collect --mode full` ({key})")
+            raise NotCalibrated(f"unknown monitor set; run `gazepoint collect --mode full{config.profile_flag()}` ({key})")
         if cur is None or cur.get("profile_key") != key:
-            raise NotCalibrated("laptop moved to this desk since last calibration; run `gazepoint collect --mode quick`")
+            raise NotCalibrated(
+                f"laptop moved to this desk since last calibration; run `gazepoint collect --mode quick{config.profile_flag()}`"
+            )
         GR, Gt = _pose_load(cur)
         for sid in ext_ids:
             screens[sid].R, screens[sid].t = compose(GR, Gt, *_pose_load(prof["monitors"][sid]))

@@ -32,6 +32,7 @@ def cmd_doctor(cfg, args):
 
     line("ok", "python", f"{platform.python_version()} on {platform.platform()}")
     line("ok", "GAZEPOINT_HOME", str(config.home()))
+    line("ok", "user profile", config.user_profile() or "default")
     st = session_type()
     line("ok" if st != "unknown" else "FAIL", "session", f"{st} / {desktop() or '?'}")
     missing = models.check(cfg)
@@ -97,8 +98,19 @@ def cmd_monitors(cfg, args):
                  "monitors": [m.to_json() for m in mons]})
 
 
+def use_session_profile(path):
+    """Calibrate/evaluate a session as the user profile that recorded it, unless
+    --profile picked one."""
+    if config.user_profile() is None:
+        p = json.loads((path / "session.json").read_text()).get("user_profile")
+        if p:
+            print(f"using profile {p}, which recorded {path.name}")
+            config.set_user_profile(p)
+
+
 def run_calibrate(cfg, session: str, mode: str | None, refit_user: bool, force: bool = False):
     path = record.resolve(session)
+    use_session_profile(path)
     meta, recs = record.load(path)
     mons = record.monitors_of(meta)
     mode = mode or meta.get("mode", "full")
@@ -125,6 +137,7 @@ def cmd_calibrate(cfg, args):
 
 def cmd_eval(cfg, args):
     path = record.resolve(args.session or record.latest().name)
+    use_session_profile(path)
     meta, recs = record.load(path)
     mons = record.monitors_of(meta)
     A, screens = calib.load_runtime(mons, cfg)
@@ -166,7 +179,8 @@ def cmd_sessions(cfg, args):
             continue
         meta = json.loads((d / "session.json").read_text())
         n = sum(1 for _ in open(d / "samples.jsonl"))
-        print(f"{d.name}  {meta.get('host', '?'):12s} {meta.get('mode', ''):6s} {n:6d} frames  {meta.get('profile_key', '')}")
+        print(f"{d.name}  {meta.get('host', '?'):12s} {meta.get('mode', ''):6s} {meta.get('user_profile') or '-':10s}"
+              f" {n:6d} frames  {meta.get('profile_key', '')}")
 
 
 def cmd_collect(cfg, args):
@@ -241,7 +255,10 @@ def cmd_bench(cfg, args):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="gazepoint", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("doctor", help="check environment, camera, monitors, permissions")
+    who = argparse.ArgumentParser(add_help=False)
+    who.add_argument("--profile", help="user profile: each person gets their own gaze correction; desk geometry "
+                     "is shared (default: GAZEPOINT_PROFILE, else the default user)")
+    sub.add_parser("doctor", parents=[who], help="check environment, camera, monitors, permissions")
     d = sub.add_parser("download-models", help="fetch face landmarker + gaze net")
     d.add_argument("--gaze", nargs="*", help=f"gaze models to fetch ({', '.join(models.GAZE_MODELS)})")
     b = sub.add_parser("bench", help="time the gaze net(s) at several thread counts")
@@ -250,27 +267,34 @@ def main(argv=None):
     b.add_argument("--threads", default="1,2,4,8,12,0", help="comma-separated onnxruntime thread counts")
     sub.add_parser("monitors", help="print detected monitors and profile key")
     sub.add_parser("preview", help="webcam preview with gaze/head overlays")
-    c = sub.add_parser("collect", help="show fixation targets, record labelled frames, calibrate, then show live gaze")
+    c = sub.add_parser("collect", parents=[who], help="show fixation targets, record labelled frames, calibrate, then show live gaze")
     c.add_argument("--mode", choices=["auto", "full", "quick"], default="auto",
-                   help="full = new desk/user (fits constellation), quick = re-place known desk")
+                   help="full = new desk (fits constellation), quick = known desk (re-places it; also fits a new "
+                        "profile's gaze correction against it)")
     c.add_argument("--rounds", type=int, default=1)
     c.add_argument("--points", type=int, help="targets per monitor (default from config)")
     c.add_argument("--no-calibrate", action="store_true", help="just record (e.g. for held-out eval)")
-    k = sub.add_parser("calibrate", help="fit calibration from a recorded session")
-    k.add_argument("session", nargs="?", help="session id/path (default: latest collect)")
+    k = sub.add_parser("calibrate", parents=[who], help="fit calibration from a recorded session")
+    k.add_argument("session", nargs="?", help="session id/path (default: latest collect); "
+                   "without --profile, fit for the profile that recorded it")
     k.add_argument("--mode", choices=["full", "quick"])
     k.add_argument("--refit-user", action="store_true", help="also refit the per-user correction in quick mode")
     k.add_argument("--force", action="store_true", help="save even if the fit looks unreliable")
-    e = sub.add_parser("eval", help="error stats for a session against the current calibration")
+    e = sub.add_parser("eval", parents=[who], help="error stats for a session against the current calibration")
     e.add_argument("session", nargs="?")
     r = sub.add_parser("reprocess", help="rerun perception on a session's saved frames")
     r.add_argument("session")
     r.add_argument("--all", action="store_true", help="also redo frames that already have observations")
     sub.add_parser("sessions", help="list recorded sessions")
-    u = sub.add_parser("run", help="live: hold the hotkey to point")
+    u = sub.add_parser("run", parents=[who], help="live: hold the hotkey to point")
     u.add_argument("--gain", type=float, help="px per degree of head rotation")
     u.add_argument("--log-clicks", action="store_true", help="X11: log frames at normal mouse clicks")
     args = p.parse_args(argv)
+    if getattr(args, "profile", None):
+        try:
+            config.set_user_profile(args.profile)
+        except ValueError as e:
+            p.error(str(e))
     cfg = config.load()
     {
         "doctor": cmd_doctor,

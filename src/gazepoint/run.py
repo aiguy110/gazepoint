@@ -53,7 +53,7 @@ import traceback
 
 import numpy as np
 
-from . import calib, record
+from . import calib, config, record
 from .calib import gaze_dir
 from .camera import Camera
 from .geometry import Screen, hit_screens
@@ -238,6 +238,7 @@ class Live:
             self.writer = record.SessionWriter(
                 "usage",
                 {
+                    "user_profile": config.user_profile(),
                     "monitors": [m.to_json() for m in self.mons],
                     "profile_key": profile_key(self.mons),
                     "camera": {"width": self.cam.width, "height": self.cam.height, "K": self.cam.K.tolist()},

@@ -31,6 +31,11 @@ and safe to re-run.
   screen) to find where the laptop is this time.
 - `run` refuses to start if the laptop hasn't been placed at this desk yet, and
   tells you which of the two to run.
+- Someone else using the laptop: give them a profile on every command
+  (`uv run gazepoint collect --profile alice`, then `run --profile alice`).
+  Each profile has its own gaze correction. At a known desk, their first
+  `collect` fits it against the desk you already calibrated and leaves yours
+  alone.
 
 To measure real error, record a held-out session and evaluate against it:
 

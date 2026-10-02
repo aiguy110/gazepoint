@@ -29,7 +29,7 @@ import tkinter as tk
 import cv2
 import numpy as np
 
-from . import calib, record
+from . import calib, config, record
 from .camera import Camera
 from .monitors import Monitor, detect, profile_key
 from .run import clamp_desktop, gaze_px
@@ -65,9 +65,9 @@ def fixation_problem(gaze: list, cc: dict) -> str | None:
     return None
 
 
-def choose_mode(mons: list[Monitor], cfg: dict) -> str:
-    if calib.load_user(cfg["gaze"]["model"]) is None:
-        return "full"
+def choose_mode(mons: list[Monitor]) -> str:
+    """quick at a known desk, even for a user profile without a gaze correction yet:
+    then A is fit against the saved constellation instead of refitting the desk."""
     if all(m.builtin for m in mons):
         return "quick"
     return "quick" if calib.load_profile(profile_key(mons)) else "full"
@@ -110,9 +110,10 @@ class Collector:
         self.cfg = cfg
         self.do_calibrate = do_calibrate
         self.mons = detect()
-        self.mode = choose_mode(self.mons, cfg) if mode == "auto" else mode
+        self.mode = choose_mode(self.mons) if mode == "auto" else mode
         cc = cfg["collect"]
-        n = points or (cc["points_full"] if self.mode == "full" else cc["points_quick"])
+        self.new_user = calib.load_user(cfg["gaze"]["model"]) is None
+        n = points or (cc["points_full"] if self.mode == "full" or self.new_user else cc["points_quick"])
         self.targets = []
         for r in range(rounds):
             order = self.mons[:]
@@ -127,6 +128,7 @@ class Collector:
             "collect",
             {
                 "mode": self.mode,
+                "user_profile": config.user_profile(),
                 "monitors": [m.to_json() for m in self.mons],
                 "profile_key": profile_key(self.mons),
                 "camera": {
@@ -532,7 +534,9 @@ class Collector:
 
 def collect(cfg: dict, mode: str = "auto", rounds: int = 1, points: int | None = None, do_calibrate: bool = True):
     col = Collector(cfg, mode, rounds, points, do_calibrate)
-    print(f"session {col.writer.id}: mode={col.mode}, {len(col.targets)} targets")
+    who = f"profile {config.user_profile()}" if config.user_profile() else "default profile"
+    print(f"session {col.writer.id}: mode={col.mode}, {who}"
+          f"{' (no gaze correction yet: fitting one)' if col.new_user else ''}, {len(col.targets)} targets")
     try:
         col.run()
     finally:
