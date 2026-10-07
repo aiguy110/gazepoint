@@ -10,9 +10,11 @@
 # Which camera: a V4L2 index (0), a /dev/videoN path, a device name as
 # `v4l2-ctl --list-devices` shows it (stable across boots, unlike loopback
 # numbers), or a video file path (looped; for testing). On the laptop,
-# "libcamera Camera" is the v4l2loopback feed from /opt/libcamera; "Intel MIPI
-# Camera" is the raw IPU6 pipeline.
-index = "libcamera Camera"
+# "gazepoint Camera" is a v4l2loopback fed from /opt/libcamera by
+# scripts/setup-camera-relay.sh, which also feeds "libcamera Camera" for video
+# calls (a loopback serves only one app at a time). "Intel MIPI Camera" is the
+# IPU6 HAL pipeline, which can't run while the relay holds the sensor.
+index = "gazepoint Camera"
 width = 1280
 height = 720
 fps = 30

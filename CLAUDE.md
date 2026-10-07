@@ -157,6 +157,12 @@ laptop's settings and the example to copy; document new settings there).
 - The collect UI can be driven headlessly: set `camera.index` to a video file
   path (it loops) and run under `xvfb-run -a -s "-screen 0 3200x1200x24"` with
   `collect.detect` monkeypatched to fake monitors.
+- The laptop's webcam (IPU6 MIPI sensor) is only reachable through
+  v4l2loopback devices, and v4l2loopback 0.15 lets only one app stream from
+  each, so gazepoint and Teams can't share one. `scripts/setup-camera-relay.sh`
+  replaces `v4l2-relayd@libcamera` with `scripts/camera-relay.py` (a root
+  service): libcamera feeds both "libcamera Camera" (for calls) and
+  "gazepoint Camera" (`camera.index`), and runs while either has a reader.
 - `pyproject.toml` forces uv-managed Python because the collect UI needs
   tkinter, which distro Pythons often lack.
 - Never set a Tk `cursor=` (not even `"none"`). uv's Python aborts with an
