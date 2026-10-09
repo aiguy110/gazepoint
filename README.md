@@ -1,10 +1,21 @@
 # gazepoint
 
-Hold Right Ctrl and the cursor jumps to where you're looking (laptop webcam).
-Keep holding and move your head to fine-tune the position. Linux, Phase 0
-prototype. See CLAUDE.md for the design.
+Hold a hotkey and point with your head; tap a second key and the mouse jumps
+to where you're looking, using only a laptop webcam. Head movements then
+fine-tune the position. Linux only; built for a laptop that docks at several
+desks with different external monitors.
 
-## Quick start (on the laptop)
+How it works: MediaPipe finds the face and head pose, a gaze net (UniGaze-B or
+ETH-XGaze) estimates where the eyes point, and a short calibration at each desk
+maps that onto your monitors. On a jump, gazepoint warps the cursor to the median
+gaze over a few frames. From then on the cursor follows your head, not your
+noisy gaze. See `CLAUDE.md` for the design.
+
+Requires Linux (X11, or GNOME Wayland), a webcam, and Python via
+[uv](https://docs.astral.sh/uv/). An Intel NPU is optional; it makes the
+larger gaze net fast.
+
+## Quick start
 
 ```sh
 git clone https://github.com/aiguy110/gazepoint ~/gazepoint
@@ -15,76 +26,25 @@ sudo scripts/setup-input-perms.sh    # once: hotkey + virtual pointer access, th
 uv run gazepoint doctor              # camera, monitors, permissions
 uv run gazepoint preview             # check the arrows: look/turn right -> arrow/yaw go right (q quits)
 uv run gazepoint collect             # dots on every screen, then auto-calibrate
-uv run gazepoint run                 # hold Right Ctrl to point; Ctrl-C to quit
+uv run gazepoint run                 # hold the hotkey to point; Ctrl-C to quit
 ```
 
-To update later, run `git pull && scripts/bootstrap.sh`.
+At a new desk, `collect` runs a full calibration; at a known one it runs a
+quick one (about 5 dots per screen) to find where the laptop is this time.
+`run` tells you which it needs. To let someone else use the laptop, add
+`--profile <name>` to every command; each profile has its own gaze correction.
 
-`bootstrap.sh` does the same-host version of `deploy.sh`. It is idempotent
-and safe to re-run.
+To update, run `git pull && scripts/bootstrap.sh`.
 
-## Day to day
+## Configuration
 
-- At a new desk (a set of monitors it hasn't seen), `collect` runs a full
-  calibration.
-- When you return to a known desk, `collect` runs a quick one (about 5 dots per
-  screen) to find where the laptop is this time.
-- `run` refuses to start if the laptop hasn't been placed at this desk yet, and
-  tells you which of the two to run.
-- Someone else using the laptop: give them a profile on every command
-  (`uv run gazepoint collect --profile alice`, then `run --profile alice`).
-  Each profile has its own gaze correction. At a known desk, their first
-  `collect` fits it against the desk you already calibrated and leaves yours
-  alone.
-
-To measure real error, record a held-out session and evaluate against it:
-
-```sh
-uv run gazepoint collect --no-calibrate
-uv run gazepoint eval
-```
-
-Settings (hotkey, gain, camera, etc.) go in `~/.config/gazepoint/config.toml`.
-Any key from `DEFAULTS` in `src/gazepoint/config.py` can be overridden, e.g.:
+`src/gazepoint/config.toml` holds every setting with comments, and its values
+are the defaults. They assume a keyboard that sends F14-F17 (the author's ZMK
+Chocofi). Copy the keys you want to change into
+`~/.config/gazepoint/config.toml`, e.g. for an ordinary keyboard:
 
 ```toml
 [run]
-hotkey = "KEY_RIGHTALT"
-gain_px_per_deg = 50
+hotkey = "KEY_RIGHTCTRL"
+aim_mode = "jump"       # key down jumps to the gaze, then the head refines
 ```
-
-With the Chocofi's gazepoint firmware (`aiguy110/miryoku_zmk`: holding the
-MOUSE thumb also holds F14, and `'` on that layer is F15):
-
-```toml
-[run]
-hotkey = "KEY_F14"
-reaim_key = "KEY_F15"   # jump to the gaze again mid-hold, e.g. to finish a drag
-slow_key = "KEY_F16"    # hold for the low head gain (gain_slow_px_per_deg) while pointing
-```
-
-## Getting data off the laptop
-
-Recorded sessions live in `~/.local/share/gazepoint/sessions`.
-
-```sh
-scripts/push-data.sh bifrost:Projects/gazepoint/data/   # rsync, if the laptop can reach the dev box
-scripts/push-data.sh                                    # otherwise: writes ~/gazepoint-data-<host>-<date>.tar.gz
-```
-
-On the dev box, place it under `data/<laptop-host>/` (the tarball does this
-itself: `tar -xzf <file> -C data/`), then:
-
-```sh
-GAZEPOINT_HOME=data/<laptop-host> uv run gazepoint sessions
-GAZEPOINT_HOME=data/<laptop-host> uv run gazepoint calibrate <session>
-```
-
-## Deploying from another machine over ssh
-
-If the dev box can reach the laptop, use these instead:
-
-- `scripts/deploy.sh <host>` rsyncs the code and runs `bootstrap.sh` there.
-- `scripts/remote.sh <host> <cmd>` runs a gazepoint command inside the laptop's
-  desktop session.
-- `scripts/pull-data.sh <host>` copies the data back.

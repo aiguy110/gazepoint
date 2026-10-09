@@ -193,7 +193,8 @@ laptop's settings and the example to copy; document new settings there).
   likely wrong.
 - The `uinput` absolute pointer on Wayland (it mimics QEMU's usb-tablet, and
   compositors should map it to the whole desktop). X11 uses XWarpPointer.
-- Default hotkey is Right Ctrl (not grabbed, so apps still see it).
+- Default hotkey is F14 from the Chocofi (`run.hotkey`; Right Ctrl is the
+  alternative on an ordinary keyboard). It isn't grabbed, so apps still see it.
   `run` prints hotkey down, the jump, and hotkey up, plus why a jump is
   stalled. It also hints once if the opposite-side key is pressed instead.
   The listener rescans every 2 s for keyboards that (re)connect. The
